@@ -107,11 +107,12 @@ func (a *AssistantHandler) Invoke(req api.Context) error {
 	}
 
 	inputStr := string(input)
+	deadline, hasDeadline := req.Context().Deadline()
 	log.Debugf("Invoke calling invoker.Thread: assistant=%s, project=%s, thread=%s, user=%s, inputLength=%d, contextDeadline=%v",
-		assistantID, projectID, threadID, userID, len(inputStr), req.Context().Deadline())
+		assistantID, projectID, threadID, userID, len(inputStr), deadline)
 
 	// Log context deadline if set
-	if deadline, ok := req.Context().Deadline(); ok {
+	if hasDeadline {
 		log.Debugf("Invoke context has deadline: assistant=%s, project=%s, thread=%s, deadline=%v, timeUntilDeadline=%v",
 			assistantID, projectID, threadID, deadline, time.Until(deadline))
 	} else {
@@ -302,13 +303,14 @@ func (a *AssistantHandler) Events(req api.Context) error {
 		WaitForThread: true,
 	}
 
+	eventsDeadline, eventsHasDeadline := req.Context().Deadline()
 	log.Debugf("Events calling events.Watch: assistant=%s, project=%s, thread=%s, threadName=%s, user=%s, options=%+v, contextDeadline=%v",
-		assistantID, projectID, threadID, thread.Name, userID, watchOptions, req.Context().Deadline())
+		assistantID, projectID, threadID, thread.Name, userID, watchOptions, eventsDeadline)
 
 	// Log context deadline if set
-	if deadline, ok := req.Context().Deadline(); ok {
+	if eventsHasDeadline {
 		log.Debugf("Events context has deadline: assistant=%s, project=%s, thread=%s, deadline=%v, timeUntilDeadline=%v",
-			assistantID, projectID, threadID, deadline, time.Until(deadline))
+			assistantID, projectID, threadID, eventsDeadline, time.Until(eventsDeadline))
 	} else {
 		log.Debugf("Events context has no deadline: assistant=%s, project=%s, thread=%s",
 			assistantID, projectID, threadID)
