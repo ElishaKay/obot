@@ -23,6 +23,7 @@ import (
 	"github.com/obot-platform/obot/pkg/storage"
 	"go.opentelemetry.io/otel"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apiserver/pkg/authentication/user"
 )
 
 var (
@@ -85,20 +86,34 @@ func (s *Server) Wrap(f api.HandlerFunc) http.HandlerFunc {
 		defer span.End()
 		req = req.WithContext(ctx)
 
-		user, err := s.authenticator.Authenticate(req)
-		if err != nil {
-			http.Error(rw, err.Error(), http.StatusUnauthorized)
-
-			if errors.Is(err, proxy.ErrInvalidSession) {
-				// The session is invalid, so tell the browser to delete the cookie so that it won't try it again.
-				http.SetCookie(rw, &http.Cookie{
-					Name:   proxy.ObotAccessTokenCookie,
-					Value:  "",
-					Path:   "/",
-					MaxAge: -1,
-				})
+		// For bootstrap MCP endpoint, handle authentication directly in the handler
+		// This bypasses the normal authentication flow
+		var user user.Info
+		var err error
+		if strings.HasPrefix(req.URL.Path, "/mcp-bootstrap/") {
+			// Skip authentication for bootstrap endpoint - handler will validate token directly
+			// Create an anonymous user that will be replaced in the handler
+			user = &user.DefaultInfo{
+				Name:   "anonymous",
+				UID:    "anonymous",
+				Groups: []string{types.UnauthenticatedGroup},
 			}
-			return
+		} else {
+			user, err = s.authenticator.Authenticate(req)
+			if err != nil {
+				http.Error(rw, err.Error(), http.StatusUnauthorized)
+
+				if errors.Is(err, proxy.ErrInvalidSession) {
+					// The session is invalid, so tell the browser to delete the cookie so that it won't try it again.
+					http.SetCookie(rw, &http.Cookie{
+						Name:   proxy.ObotAccessTokenCookie,
+						Value:  "",
+						Path:   "/",
+						MaxAge: -1,
+					})
+				}
+				return
+			}
 		}
 
 		if err := s.rateLimiter.ApplyLimit(user, rw, req); err != nil {
@@ -143,29 +158,32 @@ func (s *Server) Wrap(f api.HandlerFunc) http.HandlerFunc {
 			}
 		}
 
-		if !s.authorizer.Authorize(req, user) {
-			if _, err := req.Cookie(auth.ObotAccessTokenCookie); err == nil && req.URL.Path == "/api/me" {
-				// Tell the browser to delete the obot_access_token cookie.
-				// If the user tried to access this path and was unauthorized, then something is wrong with their token.
-				http.SetCookie(rw, &http.Cookie{
-					Name:   auth.ObotAccessTokenCookie,
-					Value:  "",
-					Path:   "/",
-					MaxAge: -1,
-				})
-			}
+		// Skip authorization for bootstrap MCP endpoint - handler will validate token and handle authorization
+		if !strings.HasPrefix(req.URL.Path, "/mcp-bootstrap/") {
+			if !s.authorizer.Authorize(req, user) {
+				if _, err := req.Cookie(auth.ObotAccessTokenCookie); err == nil && req.URL.Path == "/api/me" {
+					// Tell the browser to delete the obot_access_token cookie.
+					// If the user tried to access this path and was unauthorized, then something is wrong with their token.
+					http.SetCookie(rw, &http.Cookie{
+						Name:   auth.ObotAccessTokenCookie,
+						Value:  "",
+						Path:   "/",
+						MaxAge: -1,
+					})
+				}
 
-			if strings.HasPrefix(req.URL.Path, "/mcp-connect/") {
-				rw.Header().Set("WWW-Authenticate", fmt.Sprintf(`Bearer error="invalid_request", error_description="Invalid access token", resource_metadata="%s/.well-known/oauth-protected-resource%s"`, strings.TrimSuffix(s.baseURL, "/api"), req.URL.Path))
-			}
+				if strings.HasPrefix(req.URL.Path, "/mcp-connect/") {
+					rw.Header().Set("WWW-Authenticate", fmt.Sprintf(`Bearer error="invalid_request", error_description="Invalid access token", resource_metadata="%s/.well-known/oauth-protected-resource%s"`, strings.TrimSuffix(s.baseURL, "/api"), req.URL.Path))
+				}
 
-			if slices.Contains(user.GetGroups(), authz.UnauthenticatedGroup) {
-				http.Error(rw, "unauthorized", http.StatusUnauthorized)
-			} else {
-				http.Error(rw, "forbidden", http.StatusForbidden)
-			}
+				if slices.Contains(user.GetGroups(), authz.UnauthenticatedGroup) {
+					http.Error(rw, "unauthorized", http.StatusUnauthorized)
+				} else {
+					http.Error(rw, "forbidden", http.StatusForbidden)
+				}
 
-			return
+				return
+			}
 		}
 
 		if strings.HasPrefix(req.URL.Path, "/api/") {
