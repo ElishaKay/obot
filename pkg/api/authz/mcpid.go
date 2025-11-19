@@ -14,6 +14,13 @@ func (a *Authorizer) checkMCPID(req *http.Request, resources *Resources, user us
 		return true, nil
 	}
 
+	// Allow bootstrap users to bypass MCP access checks
+	if user.GetExtra()["auth_provider_name"] != nil && len(user.GetExtra()["auth_provider_name"]) > 0 {
+		if user.GetExtra()["auth_provider_name"][0] == "bootstrap" {
+			return true, nil
+		}
+	}
+
 	switch {
 	case system.IsMCPServerInstanceID(resources.MCPID):
 		var mcpServerInstance v1.MCPServerInstance
