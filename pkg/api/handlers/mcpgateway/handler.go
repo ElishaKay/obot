@@ -831,43 +831,60 @@ func (h *Handler) BootstrapMCPConnect(req api.Context) error {
 		return fmt.Errorf("no owner user found - please ensure at least one owner user exists")
 	}
 
-	// Create user info for the owner user
-	bootstrapUser := &user.DefaultInfo{
+	// Get the owner user's identities to use their actual auth provider info
+	identities, err := h.gatewayClient.FindIdentitiesForUser(req.Context(), ownerUser.ID)
+	if err != nil {
+		log.Warnf("BootstrapMCPConnect: Failed to get identities for owner user %d: %v, using default", ownerUser.ID, err)
+	}
+
+	// Use the first identity's auth provider if available, otherwise use "bootstrap" as fallback
+	authProviderName := "bootstrap"
+	authProviderNamespace := ""
+	if len(identities) > 0 {
+		authProviderName = identities[0].AuthProviderName
+		authProviderNamespace = identities[0].AuthProviderNamespace
+	}
+
+	// Create user info using the owner user's actual identity
+	ownerUserInfo := &user.DefaultInfo{
 		Name:   ownerUser.Username,
 		UID:    fmt.Sprintf("%d", ownerUser.ID),
 		Groups: ownerUser.Role.Groups(),
 		Extra: map[string][]string{
-			"auth_provider_name": {"bootstrap"},
+			"auth_provider_name":      {authProviderName},
+			"auth_provider_namespace": {authProviderNamespace},
+			// Mark as bootstrap-authenticated for bypass logic, but use owner's actual identity
+			"bootstrap_authenticated": {"true"},
 		},
 	}
 
-	log.Infof("BootstrapMCPConnect: Authenticated via bootstrap token for mcpID=%s, using owner user: %s (ID: %d)", mcpID, ownerUser.Username, ownerUser.ID)
+	log.Infof("BootstrapMCPConnect: Authenticated via bootstrap token for mcpID=%s, using owner user: %s (ID: %d, authProvider: %s/%s)", mcpID, ownerUser.Username, ownerUser.ID, authProviderNamespace, authProviderName)
 
 	sessionID := req.Request.Header.Get("Mcp-Session-Id")
 
-	// Create a new context with the bootstrap user for all subsequent operations
-	bootstrapContext := api.Context{
+	// Create a new context with the owner user for all subsequent operations
+	ownerContext := api.Context{
 		ResponseWriter: req.ResponseWriter,
 		Request:        req.Request,
 		GPTClient:      req.GPTClient,
 		Storage:        req.Storage,
 		GatewayClient:  req.GatewayClient,
-		User:           bootstrapUser,
+		User:           ownerUserInfo,
 		APIBaseURL:     req.APIBaseURL,
 	}
 
 	// Get the MCP server and configuration directly (bypassing authorization checks)
 	log.Debugf("BootstrapMCPConnect: Attempting to get MCP server config for mcpID=%s", mcpID)
-	_, mcpServer, mcpServerConfig, err := handlers.ServerForActionWithConnectID(bootstrapContext, mcpID, h.mcpSessionManager.TokenService(), h.baseURL)
+	_, mcpServer, mcpServerConfig, err := handlers.ServerForActionWithConnectID(ownerContext, mcpID, h.mcpSessionManager.TokenService(), h.baseURL)
 	if err == nil && mcpServer.Spec.Template {
 		log.Warnf("Attempted connection to MCP server template: %s", mcpID)
 		err = apierrors.NewNotFound(schema.GroupResource{Group: "obot.obot.ai", Resource: "mcpserver"}, mcpID)
 	}
 
-	ss := newSessionStore(h, mcpID, bootstrapUser.GetUID())
+	ss := newSessionStore(h, mcpID, ownerUserInfo.GetUID())
 
 	if err != nil {
-		log.Errorf("BootstrapMCPConnect: Failed to get MCP server config for mcpID=%s, userUID=%s: %v", mcpID, bootstrapUser.GetUID(), err)
+		log.Errorf("BootstrapMCPConnect: Failed to get MCP server config for mcpID=%s, userUID=%s: %v", mcpID, ownerUserInfo.GetUID(), err)
 		// Log more details about the error
 		if apierrors.IsNotFound(err) {
 			log.Errorf("BootstrapMCPConnect: MCP server not found: %s (may not exist or user may not have access)", mcpID)
@@ -895,18 +912,18 @@ func (h *Handler) BootstrapMCPConnect(req api.Context) error {
 	log.Infof("BootstrapMCPConnect: Successfully retrieved MCP server config: mcpID=%s, serverName=%s, runtime=%s", mcpID, mcpServer.Name, mcpServer.Spec.Manifest.Runtime)
 
 	messageCtx := messageContext{
-		userID:       bootstrapUser.GetUID(),
+		userID:       ownerUserInfo.GetUID(),
 		mcpID:        mcpID,
 		mcpServer:    mcpServer,
 		serverConfig: mcpServerConfig,
-		req:          req.Request,
-		resp:         req.ResponseWriter,
+		req:          ownerContext.Request,
+		resp:         ownerContext.ResponseWriter,
 	}
 
 	// Handle composite servers
 	if mcpServer.Spec.Manifest.Runtime == types.RuntimeComposite {
 		var componentServerList v1.MCPServerList
-		if err := bootstrapContext.List(&componentServerList,
+		if err := ownerContext.List(&componentServerList,
 			kclient.InNamespace(mcpServer.Namespace),
 			kclient.MatchingFields{
 				"spec.compositeName": mcpServer.Name,
@@ -915,7 +932,7 @@ func (h *Handler) BootstrapMCPConnect(req api.Context) error {
 		}
 
 		var componentInstanceList v1.MCPServerInstanceList
-		if err := bootstrapContext.List(&componentInstanceList,
+		if err := ownerContext.List(&componentInstanceList,
 			kclient.InNamespace(mcpServer.Namespace),
 			kclient.MatchingFields{
 				"spec.compositeName": mcpServer.Name,
@@ -945,14 +962,14 @@ func (h *Handler) BootstrapMCPConnect(req api.Context) error {
 				continue
 			}
 
-			srv, config, err := handlers.ServerForAction(bootstrapContext, componentServer.Name, h.mcpSessionManager.TokenService(), h.baseURL)
+			srv, config, err := handlers.ServerForAction(ownerContext, componentServer.Name, h.mcpSessionManager.TokenService(), h.baseURL)
 			if err != nil {
 				log.Warnf("Failed to get component server %s: %v", componentServer.Name, err)
 				continue
 			}
 
 			componentServers = append(componentServers, messageContext{
-				userID:       bootstrapUser.GetUID(),
+				userID:       ownerUserInfo.GetUID(),
 				mcpID:        srv.Name,
 				mcpServer:    srv,
 				serverConfig: config,
@@ -961,7 +978,7 @@ func (h *Handler) BootstrapMCPConnect(req api.Context) error {
 
 		for _, componentInstance := range componentInstanceList.Items {
 			var multiUserServer v1.MCPServer
-			if err := bootstrapContext.Get(&multiUserServer, componentInstance.Spec.MCPServerName); err != nil {
+			if err := ownerContext.Get(&multiUserServer, componentInstance.Spec.MCPServerName); err != nil {
 				log.Warnf("Failed to get multi-user server %s for instance %s: %v", componentInstance.Spec.MCPServerName, componentInstance.Name, err)
 				continue
 			}
@@ -971,14 +988,14 @@ func (h *Handler) BootstrapMCPConnect(req api.Context) error {
 				continue
 			}
 
-			srv, config, err := handlers.ServerForAction(bootstrapContext, multiUserServer.Name, h.mcpSessionManager.TokenService(), h.baseURL)
+			srv, config, err := handlers.ServerForAction(ownerContext, multiUserServer.Name, h.mcpSessionManager.TokenService(), h.baseURL)
 			if err != nil {
 				log.Warnf("Failed to get multi-user server %s: %v", multiUserServer.Name, err)
 				continue
 			}
 
 			componentServers = append(componentServers, messageContext{
-				userID:       bootstrapUser.GetUID(),
+				userID:       ownerUserInfo.GetUID(),
 				mcpID:        srv.Name,
 				mcpServer:    srv,
 				serverConfig: config,
@@ -992,12 +1009,13 @@ func (h *Handler) BootstrapMCPConnect(req api.Context) error {
 		messageCtx.compositeContext = newCompositeContext(mcpServer.Spec.Manifest.CompositeConfig, componentServers)
 	}
 
-	req.Request = req.WithContext(withMessageContext(req.Context(), messageCtx))
+	// Update the request context with the message context
+	ownerContext.Request = ownerContext.Request.WithContext(withMessageContext(ownerContext.Request.Context(), messageCtx))
 
-	log.Debugf("BootstrapMCPConnect: Serving MCP request: mcpID=%s, method=%s, path=%s", mcpID, req.Request.Method, req.Request.URL.Path)
+	log.Debugf("BootstrapMCPConnect: Serving MCP request: mcpID=%s, method=%s, path=%s", mcpID, ownerContext.Request.Method, ownerContext.Request.URL.Path)
 
 	// Serve the HTTP request (handles WebSocket, SSE, and direct HTTP POST)
-	nmcp.NewHTTPServer(nil, h, nmcp.HTTPServerOptions{SessionStore: ss}).ServeHTTP(req.ResponseWriter, req.Request)
+	nmcp.NewHTTPServer(nil, h, nmcp.HTTPServerOptions{SessionStore: ss}).ServeHTTP(ownerContext.ResponseWriter, ownerContext.Request)
 
 	return nil
 }
