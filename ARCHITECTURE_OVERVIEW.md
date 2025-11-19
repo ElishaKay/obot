@@ -52,8 +52,8 @@ MCP Servers (via MCP Protocol)
 2. **User sends chat message:**
    - Frontend sends POST to `/api/assistants/{id}/projects/{project_id}/threads/{thread_id}/invoke`
    - Backend `AssistantHandler.Invoke()` processes the request
-   - Calls `invoker.Thread()` which uses GPTScript to execute
-   - GPTScript calls MCP tools via `mcp.SessionManager.Run()`
+   - Calls `invoker.Thread()` which uses Langgraph to execute
+   - Langgraph calls MCP tools via `mcp.SessionManager.Run()`
    - MCP tools are executed through the MCP Gateway
 
 3. **Real-time Updates:**
@@ -78,8 +78,8 @@ MCP Servers (via MCP Protocol)
    - `mcpgateway/` - MCP protocol gateway
 
 3. **Invoker** (`pkg/invoke/invoker.go`)
-   - **NOT LangGraph** - Uses **GPTScript** instead
-   - GPTScript is a scripting language for LLM interactions
+   - Uses **Langgraph** for orchestration
+   - Langgraph is a framework for building stateful, multi-actor applications with LLMs
    - Handles tool calling, MCP integration, and execution flow
    - Key method: `Thread()` - executes chat threads
 
@@ -173,13 +173,13 @@ Returns only allowed providers
 - `pkg/api/handlers/assistants.go` - Chat/thread handlers
 - `pkg/api/handlers/modelprovider.go` - Model provider handlers
 - `pkg/api/handlers/projectmcp.go` - Project-MCP handlers
-- `pkg/invoke/invoker.go` - GPTScript execution engine
+- `pkg/invoke/invoker.go` - Langgraph execution engine
 - `pkg/mcp/runner.go` - MCP tool execution
 - `pkg/controller/handlers/toolreference/toolreference.go` - Auto-config from env vars
 
 ## Summary
 
-- **No LangGraph** - Uses GPTScript for orchestration
+- **Langgraph** - Uses Langgraph for orchestration
 - **MCP Integration** - Via MCP Gateway and Session Manager
 - **Model Providers** - Must be configured in Admin UI, even if env vars are set
 - **Real-time Updates** - SSE events stream progress to frontend
