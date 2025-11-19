@@ -568,6 +568,9 @@ func Router(ctx context.Context, services *services.Services) (http.Handler, err
 	mux.HandleFunc("DELETE /api/mcp-webhook-validations/{mcp_webhook_validation_id}/secret", mcpWebhookValidations.RemoveSecret)
 
 	// MCP Gateway Endpoints
+	// GET endpoint for MCP server configuration (for bootstrap token access)
+	mux.HandleFunc("GET /mcp-connect/{mcp_id}", mcpGateway.GetMCPConfig)
+	// WebSocket/SSE endpoint for MCP protocol communication
 	mux.HandleFunc("/mcp-connect/{mcp_id}", mcpGateway.StreamableHTTP)
 
 	// MCP Audit Logs

@@ -641,6 +641,52 @@ func fireWebhook(ctx context.Context, httpClient *http.Client, body []byte, mcpI
 	return resp.Status, nil
 }
 
+// GetMCPConfig returns the MCP server configuration in the format expected by MCP clients
+// (e.g., mcp-remote). This endpoint works with bootstrap token authentication to allow
+// programmatic access to MCP servers.
+func (h *Handler) GetMCPConfig(req api.Context) error {
+	mcpID := req.PathValue("mcp_id")
+	if mcpID == "" {
+		return fmt.Errorf("mcp_id is required")
+	}
+
+	// Get the MCP server and configuration
+	_, mcpServer, _, err := handlers.ServerForActionWithConnectID(req, mcpID, h.mcpSessionManager.TokenService(), h.baseURL)
+	if err != nil {
+		return fmt.Errorf("failed to get mcp server config: %w", err)
+	}
+
+	// Prevent access to templates
+	if mcpServer.Spec.Template {
+		return apierrors.NewNotFound(schema.GroupResource{Group: "obot.obot.ai", Resource: "mcpserver"}, mcpID)
+	}
+
+	// Get the display name for the MCP server
+	displayName := mcpServer.Spec.Manifest.Name
+	if displayName == "" {
+		displayName = mcpServer.Name
+	}
+
+	// Build the connect URL
+	connectURL := fmt.Sprintf("%s/mcp-connect/%s", h.baseURL, mcpID)
+
+	// Return the configuration in the format expected by MCP clients
+	config := map[string]interface{}{
+		"mcpServers": map[string]interface{}{
+			displayName: map[string]interface{}{
+				"command": "npx",
+				"args": []string{
+					"mcp-remote@latest",
+					connectURL,
+				},
+			},
+		},
+	}
+
+	req.ResponseWriter.Header().Set("Content-Type", "application/json")
+	return req.Write(config)
+}
+
 // Pending request helpers
 func (h *Handler) pendingRequestsForSession(sessionID string) *nmcp.PendingRequests {
 	obj, _ := h.pendingRequests.LoadOrStore(sessionID, &nmcp.PendingRequests{})

@@ -41,6 +41,13 @@ func NewMCPOAuthHandlerFactory(baseURL string, sessionManager *mcp.SessionManage
 	}
 }
 func (f *MCPOAuthHandlerFactory) CheckForMCPAuth(req api.Context, mcpServer v1.MCPServer, mcpServerConfig mcp.ServerConfig, userID, mcpID, oauthAppAuthRequestID string) (string, error) {
+	// Allow bootstrap users to bypass OAuth checks
+	if req.User.GetExtra()["auth_provider_name"] != nil && len(req.User.GetExtra()["auth_provider_name"]) > 0 {
+		if req.User.GetExtra()["auth_provider_name"][0] == "bootstrap" {
+			return "", nil
+		}
+	}
+
 	if mcpServer.Spec.Manifest.Runtime == types.RuntimeComposite {
 		var componentServers v1.MCPServerList
 		if err := f.client.List(req.Context(), &componentServers,
