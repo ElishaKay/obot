@@ -88,18 +88,18 @@ func (s *Server) Wrap(f api.HandlerFunc) http.HandlerFunc {
 
 		// For bootstrap MCP endpoint, handle authentication directly in the handler
 		// This bypasses the normal authentication flow
-		var user user.Info
+		var usr user.Info
 		var err error
 		if strings.HasPrefix(req.URL.Path, "/mcp-bootstrap/") {
 			// Skip authentication for bootstrap endpoint - handler will validate token directly
 			// Create an anonymous user that will be replaced in the handler
-			user = &user.DefaultInfo{
+			usr = &user.DefaultInfo{
 				Name:   "anonymous",
 				UID:    "anonymous",
-				Groups: []string{types.UnauthenticatedGroup},
+				Groups: []string{authz.UnauthenticatedGroup},
 			}
 		} else {
-			user, err = s.authenticator.Authenticate(req)
+			usr, err = s.authenticator.Authenticate(req)
 			if err != nil {
 				http.Error(rw, err.Error(), http.StatusUnauthorized)
 
@@ -116,7 +116,7 @@ func (s *Server) Wrap(f api.HandlerFunc) http.HandlerFunc {
 			}
 		}
 
-		if err := s.rateLimiter.ApplyLimit(user, rw, req); err != nil {
+		if err := s.rateLimiter.ApplyLimit(usr, rw, req); err != nil {
 			if errors.Is(err, ratelimiter.ErrRateLimitExceeded) {
 				// The user has exceeded their rate limit.
 				http.Error(rw, err.Error(), http.StatusTooManyRequests)
@@ -134,7 +134,7 @@ func (s *Server) Wrap(f api.HandlerFunc) http.HandlerFunc {
 				ResponseWriter: rw,
 				auditEntry: audit.LogEntry{
 					Time:      time.Now(),
-					UserID:    user.GetUID(),
+					UserID:    usr.GetUID(),
 					Method:    req.Method,
 					Path:      req.URL.Path,
 					UserAgent: req.UserAgent(),
@@ -144,23 +144,23 @@ func (s *Server) Wrap(f api.HandlerFunc) http.HandlerFunc {
 				auditLogger: s.auditLogger,
 			}
 
-			if user.GetUID() != "" && user.GetUID() != "anonymous" {
+			if usr.GetUID() != "" && usr.GetUID() != "anonymous" {
 				// Best effort
-				if err := s.gatewayClient.AddActivityForToday(req.Context(), user.GetUID()); err != nil {
-					log.Warnf("Failed to add activity tracking for user %s: %v", user.GetName(), err)
+				if err := s.gatewayClient.AddActivityForToday(req.Context(), usr.GetUID()); err != nil {
+					log.Warnf("Failed to add activity tracking for user %s: %v", usr.GetName(), err)
 				}
 			}
 		}
 
-		if user.GetExtra()["set-cookies"] != nil {
-			for _, setCookie := range user.GetExtra()["set-cookies"] {
+		if usr.GetExtra()["set-cookies"] != nil {
+			for _, setCookie := range usr.GetExtra()["set-cookies"] {
 				rw.Header().Add("Set-Cookie", setCookie)
 			}
 		}
 
 		// Skip authorization for bootstrap MCP endpoint - handler will validate token and handle authorization
 		if !strings.HasPrefix(req.URL.Path, "/mcp-bootstrap/") {
-			if !s.authorizer.Authorize(req, user) {
+			if !s.authorizer.Authorize(req, usr) {
 				if _, err := req.Cookie(auth.ObotAccessTokenCookie); err == nil && req.URL.Path == "/api/me" {
 					// Tell the browser to delete the obot_access_token cookie.
 					// If the user tried to access this path and was unauthorized, then something is wrong with their token.
@@ -176,7 +176,7 @@ func (s *Server) Wrap(f api.HandlerFunc) http.HandlerFunc {
 					rw.Header().Set("WWW-Authenticate", fmt.Sprintf(`Bearer error="invalid_request", error_description="Invalid access token", resource_metadata="%s/.well-known/oauth-protected-resource%s"`, strings.TrimSuffix(s.baseURL, "/api"), req.URL.Path))
 				}
 
-				if slices.Contains(user.GetGroups(), authz.UnauthenticatedGroup) {
+				if slices.Contains(usr.GetGroups(), authz.UnauthenticatedGroup) {
 					http.Error(rw, "unauthorized", http.StatusUnauthorized)
 				} else {
 					http.Error(rw, "forbidden", http.StatusForbidden)
@@ -199,7 +199,7 @@ func (s *Server) Wrap(f api.HandlerFunc) http.HandlerFunc {
 			GPTClient:      s.gptClient,
 			Storage:        s.storageClient,
 			GatewayClient:  s.gatewayClient,
-			User:           user,
+			User:           usr,
 			APIBaseURL:     s.baseURL,
 		})
 		duration := time.Since(start)

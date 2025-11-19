@@ -782,12 +782,12 @@ func (h *Handler) BootstrapMCPConnect(req api.Context) error {
 	// We need to ensure the user has a valid UID for the gateway
 	gatewayUser, err := h.gatewayClient.EnsureIdentityWithRole(
 		req.Context(),
-		&types.Identity{
+		&gatewaytypes.Identity{
 			ProviderUsername: "bootstrap",
 			ProviderUserID:   "bootstrap",
 		},
 		req.Request.Header.Get("X-Obot-User-Timezone"),
-		types2.RoleOwner,
+		types.RoleOwner,
 	)
 	if err != nil {
 		log.Errorf("BootstrapMCPConnect: Failed to ensure bootstrap identity: %v", err)
@@ -798,7 +798,7 @@ func (h *Handler) BootstrapMCPConnect(req api.Context) error {
 	bootstrapUser := &user.DefaultInfo{
 		Name:   "bootstrap",
 		UID:    fmt.Sprintf("%d", gatewayUser.ID),
-		Groups: []string{types2.GroupOwner, types2.GroupAdmin, types2.GroupBasic, types2.GroupAuthenticated},
+		Groups: []string{types.GroupOwner, types.GroupAdmin, types.GroupBasic, types.GroupAuthenticated},
 		Extra: map[string][]string{
 			"auth_provider_name": {"bootstrap"},
 		},
