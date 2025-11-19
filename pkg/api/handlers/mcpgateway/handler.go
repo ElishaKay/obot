@@ -810,33 +810,38 @@ func (h *Handler) BootstrapMCPConnect(req api.Context) error {
 		return nil
 	}
 
-	// Create a bootstrap user context - bypass normal authentication
-	// We need to ensure the user has a valid UID for the gateway
-	gatewayUser, err := h.gatewayClient.EnsureIdentityWithRole(
-		req.Context(),
-		&gatewaytypes.Identity{
-			ProviderUsername: "bootstrap",
-			ProviderUserID:   "bootstrap",
-		},
-		req.Request.Header.Get("X-Obot-User-Timezone"),
-		types.RoleOwner,
-	)
+	// Use the default owner user instead of creating a bootstrap user
+	// Find the first owner user in the system
+	allUsers, err := h.gatewayClient.Users(req.Context(), gatewaytypes.UserQuery{})
 	if err != nil {
-		log.Errorf("BootstrapMCPConnect: Failed to ensure bootstrap identity: %v", err)
-		return fmt.Errorf("failed to ensure bootstrap identity: %w", err)
+		log.Errorf("BootstrapMCPConnect: Failed to list users: %v", err)
+		return fmt.Errorf("failed to find owner user: %w", err)
 	}
 
-	// Create a bootstrap user info
+	var ownerUser *gatewaytypes.User
+	for i := range allUsers {
+		if allUsers[i].Role.HasRole(types.RoleOwner) {
+			ownerUser = &allUsers[i]
+			break
+		}
+	}
+
+	if ownerUser == nil {
+		log.Errorf("BootstrapMCPConnect: No owner user found in the system")
+		return fmt.Errorf("no owner user found - please ensure at least one owner user exists")
+	}
+
+	// Create user info for the owner user
 	bootstrapUser := &user.DefaultInfo{
-		Name:   "bootstrap",
-		UID:    fmt.Sprintf("%d", gatewayUser.ID),
-		Groups: []string{types.GroupOwner, types.GroupAdmin, types.GroupBasic, types.GroupAuthenticated},
+		Name:   ownerUser.Username,
+		UID:    fmt.Sprintf("%d", ownerUser.ID),
+		Groups: ownerUser.Role.Groups(),
 		Extra: map[string][]string{
 			"auth_provider_name": {"bootstrap"},
 		},
 	}
 
-	log.Infof("BootstrapMCPConnect: Authenticated via bootstrap token for mcpID=%s", mcpID)
+	log.Infof("BootstrapMCPConnect: Authenticated via bootstrap token for mcpID=%s, using owner user: %s (ID: %d)", mcpID, ownerUser.Username, ownerUser.ID)
 
 	sessionID := req.Request.Header.Get("Mcp-Session-Id")
 
@@ -852,6 +857,7 @@ func (h *Handler) BootstrapMCPConnect(req api.Context) error {
 	}
 
 	// Get the MCP server and configuration directly (bypassing authorization checks)
+	log.Debugf("BootstrapMCPConnect: Attempting to get MCP server config for mcpID=%s", mcpID)
 	_, mcpServer, mcpServerConfig, err := handlers.ServerForActionWithConnectID(bootstrapContext, mcpID, h.mcpSessionManager.TokenService(), h.baseURL)
 	if err == nil && mcpServer.Spec.Template {
 		log.Warnf("Attempted connection to MCP server template: %s", mcpID)
@@ -861,7 +867,15 @@ func (h *Handler) BootstrapMCPConnect(req api.Context) error {
 	ss := newSessionStore(h, mcpID, bootstrapUser.GetUID())
 
 	if err != nil {
-		log.Errorf("BootstrapMCPConnect: Failed to get MCP server config for mcpID=%s: %v", mcpID, err)
+		log.Errorf("BootstrapMCPConnect: Failed to get MCP server config for mcpID=%s, userUID=%s: %v", mcpID, bootstrapUser.GetUID(), err)
+		// Log more details about the error
+		if apierrors.IsNotFound(err) {
+			log.Errorf("BootstrapMCPConnect: MCP server not found: %s (may not exist or user may not have access)", mcpID)
+		} else if apierrors.IsForbidden(err) {
+			log.Errorf("BootstrapMCPConnect: Access forbidden to MCP server: %s (authorization issue)", mcpID)
+		} else {
+			log.Errorf("BootstrapMCPConnect: Unexpected error getting MCP server config: %T: %v", err, err)
+		}
 		if apierrors.IsNotFound(err) {
 			if sessionID != "" {
 				session, found, err := ss.LoadAndDelete(req.Context(), h, sessionID)
@@ -878,7 +892,7 @@ func (h *Handler) BootstrapMCPConnect(req api.Context) error {
 		return fmt.Errorf("failed to get mcp server config: %w", err)
 	}
 
-	log.Infof("BootstrapMCPConnect: Successfully retrieved MCP server config: mcpID=%s, serverName=%s", mcpID, mcpServer.Name)
+	log.Infof("BootstrapMCPConnect: Successfully retrieved MCP server config: mcpID=%s, serverName=%s, runtime=%s", mcpID, mcpServer.Name, mcpServer.Spec.Manifest.Runtime)
 
 	messageCtx := messageContext{
 		userID:       bootstrapUser.GetUID(),

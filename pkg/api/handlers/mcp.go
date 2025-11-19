@@ -1008,15 +1008,25 @@ func mcpServerOrInstanceFromConnectURL(req api.Context, id string) (v1.MCPServer
 			return v1.MCPServer{}, v1.MCPServerInstance{}, err
 		}
 		if len(servers.Items) == 0 {
+			// Check if this is a bootstrap user - bootstrap users can auto-create servers even with required config
+			isBootstrapUser := false
+			if req.User.GetExtra()["auth_provider_name"] != nil && len(req.User.GetExtra()["auth_provider_name"]) > 0 {
+				isBootstrapUser = req.User.GetExtra()["auth_provider_name"][0] == "bootstrap"
+			}
+
 			// If the user has not configured an MCP server for the catalog entry, and the catalog entry does not have any required configuration, then create an server for the user.
+			// Bootstrap users can bypass required configuration checks.
 			if entry.Spec.Manifest.Runtime == types.RuntimeComposite {
 				// For now launching composite servers by connecting to a catalog entry ID is not supported.
 				return v1.MCPServer{}, v1.MCPServerInstance{}, types.NewErrNotFound("user has not configured an MCP server for composite catalog entry %s", id)
 			}
 
-			for _, env := range entry.Spec.Manifest.Env {
-				if env.Required {
-					return v1.MCPServer{}, v1.MCPServerInstance{}, types.NewErrNotFound("user has not configured an MCP server for catalog entry %s", id)
+			// Skip required env var checks for bootstrap users
+			if !isBootstrapUser {
+				for _, env := range entry.Spec.Manifest.Env {
+					if env.Required {
+						return v1.MCPServer{}, v1.MCPServerInstance{}, types.NewErrNotFound("user has not configured an MCP server for catalog entry %s", id)
+					}
 				}
 			}
 
@@ -1025,9 +1035,12 @@ func mcpServerOrInstanceFromConnectURL(req api.Context, id string) (v1.MCPServer
 					return v1.MCPServer{}, v1.MCPServerInstance{}, types.NewErrNotFound("user has not configured an MCP server for catalog entry %s", id)
 				}
 
-				for _, h := range entry.Spec.Manifest.RemoteConfig.Headers {
-					if h.Required {
-						return v1.MCPServer{}, v1.MCPServerInstance{}, types.NewErrNotFound("user has not configured an MCP server for catalog entry %s", id)
+				// Skip required header checks for bootstrap users
+				if !isBootstrapUser {
+					for _, h := range entry.Spec.Manifest.RemoteConfig.Headers {
+						if h.Required {
+							return v1.MCPServer{}, v1.MCPServerInstance{}, types.NewErrNotFound("user has not configured an MCP server for catalog entry %s", id)
+						}
 					}
 				}
 			}
@@ -1052,6 +1065,11 @@ func mcpServerOrInstanceFromConnectURL(req api.Context, id string) (v1.MCPServer
 				},
 			}
 			if err := req.Create(&server); err != nil {
+				// Log the actual error for debugging, but return a user-friendly error
+				if isBootstrapUser {
+					// For bootstrap users, log more details since they should be able to create servers
+					return v1.MCPServer{}, v1.MCPServerInstance{}, fmt.Errorf("failed to create MCP server for bootstrap user (catalog entry %s, userID %s, namespace %s): %w", id, req.User.GetUID(), req.Namespace(), err)
+				}
 				return v1.MCPServer{}, v1.MCPServerInstance{}, types.NewErrNotFound("user has not configured an MCP server for catalog entry %s", id)
 			}
 
