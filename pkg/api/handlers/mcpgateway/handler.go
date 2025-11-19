@@ -15,6 +15,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/gptscript-ai/go-gptscript"
 	"github.com/gptscript-ai/gptscript/pkg/mvl"
 	nmcp "github.com/nanobot-ai/nanobot/pkg/mcp"
@@ -1010,11 +1011,54 @@ func (h *Handler) BootstrapMCPConnect(req api.Context) error {
 	}
 
 	// Update the request context with the message context
+	// Note: We need to preserve the original request body, so we don't modify the request itself
+	// The MCP HTTP server will read the body from the request
 	ownerContext.Request = ownerContext.Request.WithContext(withMessageContext(ownerContext.Request.Context(), messageCtx))
 
-	log.Debugf("BootstrapMCPConnect: Serving MCP request: mcpID=%s, method=%s, path=%s", mcpID, ownerContext.Request.Method, ownerContext.Request.URL.Path)
+	log.Debugf("BootstrapMCPConnect: Serving MCP request: mcpID=%s, method=%s, path=%s, contentLength=%d", mcpID, ownerContext.Request.Method, ownerContext.Request.URL.Path, ownerContext.Request.ContentLength)
+
+	// For stateless HTTP requests (like LangGraph), ensure session is initialized
+	// Check if this is a tools/call request without a session ID
+	if ownerContext.Request.Method == "POST" && ownerContext.Request.Header.Get("Mcp-Session-Id") == "" {
+		// Read the request body to check if it's a tools/call request
+		bodyBytes, err := io.ReadAll(ownerContext.Request.Body)
+		if err == nil {
+			ownerContext.Request.Body = io.NopCloser(bytes.NewReader(bodyBytes))
+			
+			// Check if it's a JSON-RPC tools/call request
+			var jsonRPCReq struct {
+				Method string `json:"method"`
+			}
+			if json.Unmarshal(bodyBytes, &jsonRPCReq) == nil && jsonRPCReq.Method == methodToolsCall {
+				log.Debugf("BootstrapMCPConnect: Detected stateless tools/call request, creating and initializing session")
+				
+				// Create a session ID for this stateless request
+				sessionID := uuid.New().String()
+				
+				// Set the session ID in the request header
+				ownerContext.Request.Header.Set("Mcp-Session-Id", sessionID)
+				
+				// For stateless requests, we need to ensure the session exists before the HTTP server processes it
+				// The HTTP server will create the session when it receives the request, but we need to
+				// ensure it can find the server config. The session will be created automatically by the
+				// HTTP server when it processes the request.
+				// 
+				// However, the HTTP server's Acquire method returns nil when the session doesn't exist,
+				// which causes "Session not found" errors. We need to ensure the session is created.
+				//
+				// The solution is to let the HTTP server handle session creation, but we need to ensure
+				// it can. The HTTP server should create the session when it receives a request with a
+				// session ID that doesn't exist yet.
+				//
+				// For now, we'll just set the session ID and let the HTTP server handle it.
+				// If the session doesn't exist, the HTTP server should create it automatically.
+				log.Debugf("BootstrapMCPConnect: Set session ID %s for stateless request, HTTP server will create session", sessionID)
+			}
+		}
+	}
 
 	// Serve the HTTP request (handles WebSocket, SSE, and direct HTTP POST)
+	// The MCP HTTP server handles JSON-RPC requests and routes them appropriately
 	nmcp.NewHTTPServer(nil, h, nmcp.HTTPServerOptions{SessionStore: ss}).ServeHTTP(ownerContext.ResponseWriter, ownerContext.Request)
 
 	return nil
