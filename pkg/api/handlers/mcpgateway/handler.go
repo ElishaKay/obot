@@ -79,21 +79,38 @@ func NewHandler(storageClient kclient.Client, mcpSessionManager *mcp.SessionMana
 
 func (h *Handler) StreamableHTTP(req api.Context) error {
 	sessionID := req.Request.Header.Get("Mcp-Session-Id")
+	mcpID := req.PathValue("mcp_id")
 
-	mcpID, mcpServer, mcpServerConfig, err := handlers.ServerForActionWithConnectID(req, req.PathValue("mcp_id"), h.mcpSessionManager.TokenService(), h.baseURL)
+	// Log authentication details for debugging
+	bootstrapToken := req.Request.Header.Get("OBOT_BOOTSTRAP_TOKEN")
+	authHeader := req.Request.Header.Get("Authorization")
+	userName := req.User.GetName()
+	userUID := req.User.GetUID()
+	authProviderName := ""
+	if req.User.GetExtra()["auth_provider_name"] != nil && len(req.User.GetExtra()["auth_provider_name"]) > 0 {
+		authProviderName = req.User.GetExtra()["auth_provider_name"][0]
+	}
+
+	log.Infof("MCP connection attempt: mcpID=%s, method=%s, userName=%s, userUID=%s, authProvider=%s, hasBootstrapToken=%v, hasAuthHeader=%v",
+		mcpID, req.Request.Method, userName, userUID, authProviderName, bootstrapToken != "", authHeader != "")
+
+	mcpID, mcpServer, mcpServerConfig, err := handlers.ServerForActionWithConnectID(req, mcpID, h.mcpSessionManager.TokenService(), h.baseURL)
 	if err == nil && mcpServer.Spec.Template {
 		// Prevent connections to MCP server templates by returning a 404.
+		log.Warnf("Attempted connection to MCP server template: %s", mcpID)
 		err = apierrors.NewNotFound(schema.GroupResource{Group: "obot.obot.ai", Resource: "mcpserver"}, mcpID)
 	}
 
 	ss := newSessionStore(h, mcpID, req.User.GetUID())
 
 	if err != nil {
+		log.Errorf("Failed to get MCP server config for mcpID=%s, userUID=%s, authProvider=%s: %v", mcpID, userUID, authProviderName, err)
 		if apierrors.IsNotFound(err) {
 			// If the MCP server is not found, remove the session.
 			if sessionID != "" {
 				session, found, err := ss.LoadAndDelete(req.Context(), h, sessionID)
 				if err != nil {
+					log.Errorf("Failed to delete session %s: %v", sessionID, err)
 					return fmt.Errorf("failed to get mcp server config: %w", err)
 				}
 
@@ -105,6 +122,8 @@ func (h *Handler) StreamableHTTP(req api.Context) error {
 
 		return fmt.Errorf("failed to get mcp server config: %w", err)
 	}
+
+	log.Infof("Successfully retrieved MCP server config: mcpID=%s, serverName=%s, userUID=%s", mcpID, mcpServer.Name, userUID)
 
 	messageCtx := messageContext{
 		userID:       req.User.GetUID(),
@@ -211,6 +230,10 @@ func (h *Handler) StreamableHTTP(req api.Context) error {
 
 	req.Request = req.WithContext(withMessageContext(req.Context(), messageCtx))
 
+	// Log before serving the request
+	log.Debugf("Serving MCP request: mcpID=%s, method=%s, path=%s", mcpID, req.Request.Method, req.Request.URL.Path)
+
+	// Serve the HTTP request (handles WebSocket, SSE, and direct HTTP POST)
 	nmcp.NewHTTPServer(nil, h, nmcp.HTTPServerOptions{SessionStore: ss}).ServeHTTP(req.ResponseWriter, req.Request)
 
 	return nil
@@ -308,6 +331,7 @@ func (h *Handler) onMessage(ctx context.Context, msg nmcp.Message, m messageCont
 
 			var oauthErr nmcp.AuthRequiredErr
 			if errors.As(err, &oauthErr) {
+				log.Errorf("OAuth error for MCP server %s (mcpID=%s, userID=%s, method=%s): %v", m.mcpServer.Name, m.mcpID, m.userID, msg.Method, oauthErr)
 				auditLog.ResponseStatus = http.StatusUnauthorized
 				m.resp.Header().Set(
 					"WWW-Authenticate",
@@ -317,6 +341,8 @@ func (h *Handler) onMessage(ctx context.Context, msg nmcp.Message, m messageCont
 				h.gatewayClient.LogMCPAuditEntry(auditLog)
 				return
 			}
+
+			log.Errorf("Error processing MCP message for server %s (mcpID=%s, userID=%s, method=%s): %v", m.mcpServer.Name, m.mcpID, m.userID, msg.Method, err)
 
 			if rpcError := (*nmcp.RPCError)(nil); errors.As(err, &rpcError) {
 				msg.SendError(ctx, rpcError)
@@ -384,7 +410,7 @@ func (h *Handler) onMessage(ctx context.Context, msg nmcp.Message, m messageCont
 		),
 	)
 	if err != nil {
-		log.Errorf("Failed to get client for server %s: %v", m.mcpServer.Name, err)
+		log.Errorf("Failed to get MCP client for server %s (mcpID=%s, userID=%s, method=%s): %v", m.mcpServer.Name, m.mcpID, m.userID, msg.Method, err)
 		return
 	}
 
@@ -667,8 +693,20 @@ func (h *Handler) GetMCPConfig(req api.Context) error {
 		displayName = mcpServer.Name
 	}
 
-	// Build the connect URL
-	connectURL := fmt.Sprintf("%s/mcp-connect/%s", h.baseURL, mcpID)
+	// Build the connect URL - use bootstrap endpoint if authenticated via bootstrap token
+	authProviderName := ""
+	if req.User.GetExtra()["auth_provider_name"] != nil && len(req.User.GetExtra()["auth_provider_name"]) > 0 {
+		authProviderName = req.User.GetExtra()["auth_provider_name"][0]
+	}
+	
+	var connectURL string
+	if authProviderName == "bootstrap" {
+		// Use bootstrap endpoint for bootstrap-authenticated users
+		connectURL = fmt.Sprintf("%s/mcp-bootstrap/%s", h.baseURL, mcpID)
+	} else {
+		// Use regular endpoint for other users
+		connectURL = fmt.Sprintf("%s/mcp-connect/%s", h.baseURL, mcpID)
+	}
 
 	// Return the configuration in the format expected by MCP clients
 	config := map[string]interface{}{
@@ -685,6 +723,166 @@ func (h *Handler) GetMCPConfig(req api.Context) error {
 
 	req.ResponseWriter.Header().Set("Content-Type", "application/json")
 	return req.Write(config)
+}
+
+// BootstrapMCPConnect handles MCP protocol requests using only bootstrap token authentication.
+// This endpoint bypasses OAuth and other authorization checks, relying solely on OBOT_BOOTSTRAP_TOKEN.
+func (h *Handler) BootstrapMCPConnect(req api.Context) error {
+	mcpID := req.PathValue("mcp_id")
+	if mcpID == "" {
+		return fmt.Errorf("mcp_id is required")
+	}
+
+	// Verify bootstrap token authentication
+	authProviderName := ""
+	if req.User.GetExtra()["auth_provider_name"] != nil && len(req.User.GetExtra()["auth_provider_name"]) > 0 {
+		authProviderName = req.User.GetExtra()["auth_provider_name"][0]
+	}
+	
+	if authProviderName != "bootstrap" {
+		log.Warnf("BootstrapMCPConnect: user is not authenticated as bootstrap (authProvider=%s)", authProviderName)
+		req.ResponseWriter.Header().Set("WWW-Authenticate", `Bearer error="invalid_token", error_description="OBOT_BOOTSTRAP_TOKEN required"`)
+		http.Error(req.ResponseWriter, "unauthorized: OBOT_BOOTSTRAP_TOKEN required", http.StatusUnauthorized)
+		return nil
+	}
+
+	sessionID := req.Request.Header.Get("Mcp-Session-Id")
+
+	// Get the MCP server and configuration directly (bypassing authorization checks)
+	_, mcpServer, mcpServerConfig, err := handlers.ServerForActionWithConnectID(req, mcpID, h.mcpSessionManager.TokenService(), h.baseURL)
+	if err == nil && mcpServer.Spec.Template {
+		log.Warnf("Attempted connection to MCP server template: %s", mcpID)
+		err = apierrors.NewNotFound(schema.GroupResource{Group: "obot.obot.ai", Resource: "mcpserver"}, mcpID)
+	}
+
+	ss := newSessionStore(h, mcpID, req.User.GetUID())
+
+	if err != nil {
+		log.Errorf("BootstrapMCPConnect: Failed to get MCP server config for mcpID=%s: %v", mcpID, err)
+		if apierrors.IsNotFound(err) {
+			if sessionID != "" {
+				session, found, err := ss.LoadAndDelete(req.Context(), h, sessionID)
+				if err != nil {
+					log.Errorf("Failed to delete session %s: %v", sessionID, err)
+					return fmt.Errorf("failed to get mcp server config: %w", err)
+				}
+
+				if found {
+					session.Close(true)
+				}
+			}
+		}
+		return fmt.Errorf("failed to get mcp server config: %w", err)
+	}
+
+	log.Infof("BootstrapMCPConnect: Successfully retrieved MCP server config: mcpID=%s, serverName=%s", mcpID, mcpServer.Name)
+
+	messageCtx := messageContext{
+		userID:       req.User.GetUID(),
+		mcpID:        mcpID,
+		mcpServer:    mcpServer,
+		serverConfig: mcpServerConfig,
+		req:          req.Request,
+		resp:         req.ResponseWriter,
+	}
+
+	// Handle composite servers
+	if mcpServer.Spec.Manifest.Runtime == types.RuntimeComposite {
+		var componentServerList v1.MCPServerList
+		if err := req.List(&componentServerList,
+			kclient.InNamespace(mcpServer.Namespace),
+			kclient.MatchingFields{
+				"spec.compositeName": mcpServer.Name,
+			}); err != nil {
+			return fmt.Errorf("failed to list component servers for composite server %s: %v", mcpServer.Name, err)
+		}
+
+		var componentInstanceList v1.MCPServerInstanceList
+		if err := req.List(&componentInstanceList,
+			kclient.InNamespace(mcpServer.Namespace),
+			kclient.MatchingFields{
+				"spec.compositeName": mcpServer.Name,
+			}); err != nil {
+			return fmt.Errorf("failed to list component instances for composite server %s: %v", mcpServer.Name, err)
+		}
+
+		var compositeConfig types.CompositeRuntimeConfig
+		if mcpServer.Spec.Manifest.CompositeConfig != nil {
+			compositeConfig = *mcpServer.Spec.Manifest.CompositeConfig
+		}
+
+		disabledComponents := make(map[string]bool, len(compositeConfig.ComponentServers))
+		for _, comp := range compositeConfig.ComponentServers {
+			if comp.CatalogEntryID != "" {
+				disabledComponents[comp.CatalogEntryID] = comp.Disabled
+			} else if comp.MCPServerID != "" {
+				disabledComponents[comp.MCPServerID] = comp.Disabled
+			}
+		}
+
+		componentServers := make([]messageContext, 0, len(componentServerList.Items)+len(componentInstanceList.Items))
+
+		for _, componentServer := range componentServerList.Items {
+			if disabledComponents[componentServer.Spec.MCPServerCatalogEntryName] {
+				log.Debugf("Skipping component server %s not enabled in composite config", componentServer.Name)
+				continue
+			}
+
+			srv, config, err := handlers.ServerForAction(req, componentServer.Name, h.mcpSessionManager.TokenService(), h.baseURL)
+			if err != nil {
+				log.Warnf("Failed to get component server %s: %v", componentServer.Name, err)
+				continue
+			}
+
+			componentServers = append(componentServers, messageContext{
+				userID:       req.User.GetUID(),
+				mcpID:        srv.Name,
+				mcpServer:    srv,
+				serverConfig: config,
+			})
+		}
+
+		for _, componentInstance := range componentInstanceList.Items {
+			var multiUserServer v1.MCPServer
+			if err := req.Get(&multiUserServer, componentInstance.Spec.MCPServerName); err != nil {
+				log.Warnf("Failed to get multi-user server %s for instance %s: %v", componentInstance.Spec.MCPServerName, componentInstance.Name, err)
+				continue
+			}
+
+			if disabledComponents[multiUserServer.Name] {
+				log.Debugf("Skipping component instance %s not enabled in composite config", componentInstance.Name)
+				continue
+			}
+
+			srv, config, err := handlers.ServerForAction(req, multiUserServer.Name, h.mcpSessionManager.TokenService(), h.baseURL)
+			if err != nil {
+				log.Warnf("Failed to get multi-user server %s: %v", multiUserServer.Name, err)
+				continue
+			}
+
+			componentServers = append(componentServers, messageContext{
+				userID:       req.User.GetUID(),
+				mcpID:        srv.Name,
+				mcpServer:    srv,
+				serverConfig: config,
+			})
+		}
+
+		if len(componentServers) < 1 {
+			return fmt.Errorf("composite server %s has no running component servers", mcpServer.Name)
+		}
+
+		messageCtx.compositeContext = newCompositeContext(mcpServer.Spec.Manifest.CompositeConfig, componentServers)
+	}
+
+	req.Request = req.WithContext(withMessageContext(req.Context(), messageCtx))
+
+	log.Debugf("BootstrapMCPConnect: Serving MCP request: mcpID=%s, method=%s, path=%s", mcpID, req.Request.Method, req.Request.URL.Path)
+
+	// Serve the HTTP request (handles WebSocket, SSE, and direct HTTP POST)
+	nmcp.NewHTTPServer(nil, h, nmcp.HTTPServerOptions{SessionStore: ss}).ServeHTTP(req.ResponseWriter, req.Request)
+
+	return nil
 }
 
 // Pending request helpers

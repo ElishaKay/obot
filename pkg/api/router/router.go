@@ -570,6 +570,8 @@ func Router(ctx context.Context, services *services.Services) (http.Handler, err
 	// MCP Gateway Endpoints
 	// GET endpoint for MCP server configuration (for bootstrap token access)
 	mux.HandleFunc("GET /mcp-connect/{mcp_id}", mcpGateway.GetMCPConfig)
+	// Bootstrap-only MCP endpoint (bypasses OAuth and authorization checks)
+	mux.HandleFunc("/mcp-bootstrap/{mcp_id}", mcpGateway.BootstrapMCPConnect)
 	// WebSocket/SSE endpoint for MCP protocol communication
 	mux.HandleFunc("/mcp-connect/{mcp_id}", mcpGateway.StreamableHTTP)
 

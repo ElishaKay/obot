@@ -2,6 +2,7 @@ package authz
 
 import (
 	"net/http"
+	"strings"
 
 	"github.com/obot-platform/obot/apiclient/types"
 	v1 "github.com/obot-platform/obot/pkg/storage/apis/obot.obot.ai/v1"
@@ -22,6 +23,9 @@ var apiResources = map[string][]string{
 		"GET    /mcp-connect/{mcp_id}",
 		"POST   /mcp-connect/{mcp_id}",
 		"DELETE /mcp-connect/{mcp_id}",
+		"GET    /mcp-bootstrap/{mcp_id}",
+		"POST   /mcp-bootstrap/{mcp_id}",
+		"DELETE /mcp-bootstrap/{mcp_id}",
 		"GET    /api/mcp-stats/{mcp_id}",
 		"GET    /api/mcp-audit-logs/{mcp_id}",
 		"GET    /api/assistants",
@@ -304,6 +308,15 @@ type ResourcesAuthorized struct {
 }
 
 func (a *Authorizer) evaluateResources(req *http.Request, vars GetVar, user user.Info) (bool, error) {
+	// Allow bootstrap users to bypass resource checks for bootstrap MCP endpoint
+	if strings.HasPrefix(req.URL.Path, "/mcp-bootstrap/") {
+		if user.GetExtra()["auth_provider_name"] != nil && len(user.GetExtra()["auth_provider_name"]) > 0 {
+			if user.GetExtra()["auth_provider_name"][0] == "bootstrap" {
+				return true, nil
+			}
+		}
+	}
+
 	resources := Resources{
 		AssistantID:            vars("assistant_id"),
 		ProjectID:              vars("project_id"),
