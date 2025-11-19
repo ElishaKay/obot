@@ -6,6 +6,7 @@ import (
 	"slices"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/gptscript-ai/go-gptscript"
 	"github.com/obot-platform/obot/apiclient/types"
@@ -106,8 +107,17 @@ func (a *AssistantHandler) Invoke(req api.Context) error {
 	}
 
 	inputStr := string(input)
-	log.Debugf("Invoke calling invoker.Thread: assistant=%s, project=%s, thread=%s, user=%s, inputLength=%d",
-		assistantID, projectID, threadID, userID, len(inputStr))
+	log.Debugf("Invoke calling invoker.Thread: assistant=%s, project=%s, thread=%s, user=%s, inputLength=%d, contextDeadline=%v",
+		assistantID, projectID, threadID, userID, len(inputStr), req.Context().Deadline())
+
+	// Log context deadline if set
+	if deadline, ok := req.Context().Deadline(); ok {
+		log.Debugf("Invoke context has deadline: assistant=%s, project=%s, thread=%s, deadline=%v, timeUntilDeadline=%v",
+			assistantID, projectID, threadID, deadline, time.Until(deadline))
+	} else {
+		log.Debugf("Invoke context has no deadline: assistant=%s, project=%s, thread=%s",
+			assistantID, projectID, threadID)
+	}
 
 	resp, err := a.invoker.Thread(req.Context(), a.cachedClient, &thread, inputStr, invoke.Options{
 		GenerateName:    system.ChatRunPrefix,
@@ -115,8 +125,13 @@ func (a *AssistantHandler) Invoke(req api.Context) error {
 		IgnoreMCPErrors: true,
 	})
 	if err != nil {
-		log.Errorf("Invoke failed: assistant=%s, project=%s, thread=%s, user=%s, error=%v",
-			assistantID, projectID, threadID, userID, err)
+		log.Errorf("Invoke failed: assistant=%s, project=%s, thread=%s, user=%s, error=%v, errorType=%T",
+			assistantID, projectID, threadID, userID, err, err)
+		// Check if it's a context error
+		if req.Context().Err() != nil {
+			log.Errorf("Invoke context error: assistant=%s, project=%s, thread=%s, user=%s, contextErr=%v",
+				assistantID, projectID, threadID, userID, req.Context().Err())
+		}
 		return err
 	}
 	defer resp.Close()
@@ -287,17 +302,31 @@ func (a *AssistantHandler) Events(req api.Context) error {
 		WaitForThread: true,
 	}
 
-	log.Debugf("Events calling events.Watch: assistant=%s, project=%s, thread=%s, threadName=%s, user=%s, options=%+v",
-		assistantID, projectID, threadID, thread.Name, userID, watchOptions)
+	log.Debugf("Events calling events.Watch: assistant=%s, project=%s, thread=%s, threadName=%s, user=%s, options=%+v, contextDeadline=%v",
+		assistantID, projectID, threadID, thread.Name, userID, watchOptions, req.Context().Deadline())
+
+	// Log context deadline if set
+	if deadline, ok := req.Context().Deadline(); ok {
+		log.Debugf("Events context has deadline: assistant=%s, project=%s, thread=%s, deadline=%v, timeUntilDeadline=%v",
+			assistantID, projectID, threadID, deadline, time.Until(deadline))
+	} else {
+		log.Debugf("Events context has no deadline: assistant=%s, project=%s, thread=%s",
+			assistantID, projectID, threadID)
+	}
 
 	_, eventsChan, err := a.events.Watch(req.Context(), req.Namespace(), watchOptions)
 	if err != nil {
-		log.Errorf("Events failed to watch: assistant=%s, project=%s, thread=%s, threadName=%s, user=%s, error=%v",
-			assistantID, projectID, threadID, thread.Name, userID, err)
+		log.Errorf("Events failed to watch: assistant=%s, project=%s, thread=%s, threadName=%s, user=%s, error=%v, errorType=%T",
+			assistantID, projectID, threadID, thread.Name, userID, err, err)
+		// Check if it's a context error
+		if req.Context().Err() != nil {
+			log.Errorf("Events context error: assistant=%s, project=%s, thread=%s, threadName=%s, user=%s, contextErr=%v",
+				assistantID, projectID, threadID, thread.Name, userID, req.Context().Err())
+		}
 		return err
 	}
 
-	log.Debugf("Events watch started: assistant=%s, project=%s, thread=%s, threadName=%s, user=%s",
+	log.Debugf("Events watch started successfully: assistant=%s, project=%s, thread=%s, threadName=%s, user=%s",
 		assistantID, projectID, threadID, thread.Name, userID)
 
 	return req.WriteEvents(eventsChan)
