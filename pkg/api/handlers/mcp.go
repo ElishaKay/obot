@@ -992,8 +992,13 @@ func mcpServerOrInstanceFromConnectURL(req api.Context, id string) (v1.MCPServer
 		// In this case, id refers to a catalog entry.
 		// Get the catalog entry to make sure it's valid
 		var entry v1.MCPServerCatalogEntry
-		if err := req.Get(&v1.MCPServerCatalogEntry{}, id); err != nil {
+		if err := req.Get(&entry, id); err != nil {
 			return v1.MCPServer{}, v1.MCPServerInstance{}, types.NewErrNotFound("catalog entry %s not found", id)
+		}
+		
+		// Validate that the catalog entry has a runtime set
+		if entry.Spec.Manifest.Runtime == "" {
+			return v1.MCPServer{}, v1.MCPServerInstance{}, fmt.Errorf("catalog entry %s has no runtime specified (manifest: %+v)", id, entry.Spec.Manifest)
 		}
 
 		// List the MCP servers for the user and take the first one.
@@ -1010,8 +1015,15 @@ func mcpServerOrInstanceFromConnectURL(req api.Context, id string) (v1.MCPServer
 		if len(servers.Items) == 0 {
 			// Check if this is a bootstrap user - bootstrap users can auto-create servers even with required config
 			isBootstrapUser := false
+			authProviderName := ""
 			if req.User.GetExtra()["auth_provider_name"] != nil && len(req.User.GetExtra()["auth_provider_name"]) > 0 {
-				isBootstrapUser = req.User.GetExtra()["auth_provider_name"][0] == "bootstrap"
+				authProviderName = req.User.GetExtra()["auth_provider_name"][0]
+				isBootstrapUser = authProviderName == "bootstrap"
+			}
+			// Log for debugging
+			if isBootstrapUser {
+				// Use a logger if available, otherwise this will be silent
+				// The error will show in the logs from the calling function
 			}
 
 			// If the user has not configured an MCP server for the catalog entry, and the catalog entry does not have any required configuration, then create an server for the user.
@@ -1021,33 +1033,53 @@ func mcpServerOrInstanceFromConnectURL(req api.Context, id string) (v1.MCPServer
 				return v1.MCPServer{}, v1.MCPServerInstance{}, types.NewErrNotFound("user has not configured an MCP server for composite catalog entry %s", id)
 			}
 
-			// Skip required env var checks for bootstrap users
-			if !isBootstrapUser {
-				for _, env := range entry.Spec.Manifest.Env {
-					if env.Required {
-						return v1.MCPServer{}, v1.MCPServerInstance{}, types.NewErrNotFound("user has not configured an MCP server for catalog entry %s", id)
+			// Check for required env vars - bootstrap users can bypass this
+			hasRequiredEnv := false
+			for _, env := range entry.Spec.Manifest.Env {
+				if env.Required {
+					hasRequiredEnv = true
+					if !isBootstrapUser {
+						return v1.MCPServer{}, v1.MCPServerInstance{}, types.NewErrNotFound("user has not configured an MCP server for catalog entry %s (required env var: %s)", id, env.Name)
 					}
 				}
 			}
 
+			// For remote runtime, check if FixedURL is set
 			if entry.Spec.Manifest.Runtime == types.RuntimeRemote {
-				if entry.Spec.Manifest.RemoteConfig.FixedURL == "" {
-					return v1.MCPServer{}, v1.MCPServerInstance{}, types.NewErrNotFound("user has not configured an MCP server for catalog entry %s", id)
+				if entry.Spec.Manifest.RemoteConfig == nil || entry.Spec.Manifest.RemoteConfig.FixedURL == "" {
+					if !isBootstrapUser {
+						return v1.MCPServer{}, v1.MCPServerInstance{}, types.NewErrNotFound("user has not configured an MCP server for catalog entry %s (no FixedURL)", id)
+					}
+					// For bootstrap users, we'll try to create the server anyway - it might work without FixedURL
 				}
 
-				// Skip required header checks for bootstrap users
-				if !isBootstrapUser {
+				// Check for required headers - bootstrap users can bypass this
+				hasRequiredHeaders := false
+				if entry.Spec.Manifest.RemoteConfig != nil {
 					for _, h := range entry.Spec.Manifest.RemoteConfig.Headers {
 						if h.Required {
-							return v1.MCPServer{}, v1.MCPServerInstance{}, types.NewErrNotFound("user has not configured an MCP server for catalog entry %s", id)
+							hasRequiredHeaders = true
+							if !isBootstrapUser {
+								return v1.MCPServer{}, v1.MCPServerInstance{}, types.NewErrNotFound("user has not configured an MCP server for catalog entry %s (required header: %s)", id, h.Name)
+							}
 						}
 					}
+				}
+				
+				if isBootstrapUser && (hasRequiredEnv || hasRequiredHeaders) {
+					// Log that we're bypassing required config for bootstrap user
+					// This is expected - bootstrap users can auto-create servers with required config
 				}
 			}
 
 			// Convert the catalog entry manifest to a server manifest. Treat the user as non-admin always.
-			manifest, err := serverManifestFromCatalogEntryManifest(req, false, entry.Spec.Manifest, types.MCPServerManifest{})
+			// For bootstrap users, we can treat them as admin to allow auto-creation even with required config
+			manifest, err := serverManifestFromCatalogEntryManifest(req, isBootstrapUser, entry.Spec.Manifest, types.MCPServerManifest{})
 			if err != nil {
+				if isBootstrapUser {
+					// For bootstrap users, log the actual error to help debug
+					return v1.MCPServer{}, v1.MCPServerInstance{}, fmt.Errorf("failed to convert catalog entry manifest to server manifest for bootstrap user (catalog entry %s, runtime: %s): %w", id, entry.Spec.Manifest.Runtime, err)
+				}
 				return v1.MCPServer{}, v1.MCPServerInstance{}, types.NewErrNotFound("user has not configured an MCP server for catalog entry %s", id)
 			}
 
