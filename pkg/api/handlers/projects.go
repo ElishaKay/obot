@@ -675,16 +675,30 @@ func (h *ProjectsHandler) streamThreads(req api.Context, matches func(t *v1.Thre
 }
 
 func (h *ProjectsHandler) ListProjectThreads(req api.Context) error {
+	assistantID := req.PathValue("assistant_id")
+	projectID := req.PathValue("project_id")
+	userID := req.User.GetUID()
+
+	log.Debugf("ListProjectThreads request: assistant=%s, project=%s, user=%s, method=%s, path=%s, isStream=%v",
+		assistantID, projectID, userID, req.Request.Method, req.Request.URL.Path, req.IsStreamRequested())
+
 	var (
 		threads v1.ThreadList
 	)
 
 	projectThread, err := h.getProjectThread(req)
 	if err != nil {
+		log.Errorf("ListProjectThreads failed to get project thread: assistant=%s, project=%s, user=%s, error=%v",
+			assistantID, projectID, userID, err)
 		return err
 	}
 
+	log.Debugf("ListProjectThreads got project thread: assistant=%s, project=%s, projectThreadName=%s, user=%s",
+		assistantID, projectID, projectThread.Name, userID)
+
 	if req.IsStreamRequested() {
+		log.Debugf("ListProjectThreads using stream mode: assistant=%s, project=%s, projectThreadName=%s, user=%s",
+			assistantID, projectID, projectThread.Name, userID)
 		// Field selectors don't work right now....
 		return h.streamThreads(req, func(t *v1.Thread) bool {
 			return !t.Spec.Project &&
@@ -699,9 +713,17 @@ func (h *ProjectsHandler) ListProjectThreads(req api.Context) error {
 		"spec.parentThreadName": projectThread.Name,
 	}
 
+	log.Debugf("ListProjectThreads listing threads: assistant=%s, project=%s, projectThreadName=%s, user=%s, selector=%+v",
+		assistantID, projectID, projectThread.Name, userID, selector)
+
 	if err := req.List(&threads, selector); err != nil {
+		log.Errorf("ListProjectThreads failed to list threads: assistant=%s, project=%s, projectThreadName=%s, user=%s, error=%v",
+			assistantID, projectID, projectThread.Name, userID, err)
 		return err
 	}
+
+	log.Debugf("ListProjectThreads found %d threads: assistant=%s, project=%s, projectThreadName=%s, user=%s",
+		len(threads.Items), assistantID, projectID, projectThread.Name, userID)
 
 	var result types.ThreadList
 	for _, thread := range threads.Items {
@@ -713,6 +735,9 @@ func (h *ProjectsHandler) ListProjectThreads(req api.Context) error {
 		}
 		result.Items = append(result.Items, convertThread(thread))
 	}
+
+	log.Debugf("ListProjectThreads returning %d threads: assistant=%s, project=%s, projectThreadName=%s, user=%s",
+		len(result.Items), assistantID, projectID, projectThread.Name, userID)
 
 	return req.Write(result)
 }
