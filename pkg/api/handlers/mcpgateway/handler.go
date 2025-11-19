@@ -735,21 +735,53 @@ func (h *Handler) BootstrapMCPConnect(req api.Context) error {
 	}
 
 	// Validate bootstrap token directly from request header
+	// Log all headers for debugging (but don't log values for security)
+	var headerNames []string
+	for name, values := range req.Request.Header {
+		headerNames = append(headerNames, fmt.Sprintf("%s (len=%d)", name, len(values)))
+		// Check if this looks like our bootstrap token header (case-insensitive)
+		if strings.EqualFold(name, "OBOT_BOOTSTRAP_TOKEN") || strings.EqualFold(name, "Obot-Bootstrap-Token") {
+			log.Debugf("BootstrapMCPConnect: Found potential bootstrap token header: %s with %d value(s)", name, len(values))
+		}
+	}
+	log.Debugf("BootstrapMCPConnect: Request headers: %v", headerNames)
+	
 	bootstrapTokenHeader := req.Request.Header.Get("OBOT_BOOTSTRAP_TOKEN")
+	if bootstrapTokenHeader == "" {
+		// Try case-insensitive lookup - Go's Header.Get should handle this, but let's be explicit
+		for name, values := range req.Request.Header {
+			if strings.EqualFold(name, "OBOT_BOOTSTRAP_TOKEN") {
+				if len(values) > 0 {
+					bootstrapTokenHeader = values[0]
+					log.Debugf("BootstrapMCPConnect: Found bootstrap token in header %s (case-insensitive lookup)", name)
+					break
+				}
+			}
+		}
+	} else {
+		log.Debugf("BootstrapMCPConnect: Found bootstrap token via Header.Get()")
+	}
+	
 	if bootstrapTokenHeader == "" {
 		// Try Authorization header as fallback
 		authHeader := req.Request.Header.Get("Authorization")
+		if authHeader != "" {
+			log.Debugf("BootstrapMCPConnect: Found Authorization header, checking for Bearer token")
+		}
 		if strings.HasPrefix(authHeader, "Bearer ") {
 			bootstrapTokenHeader = strings.TrimPrefix(authHeader, "Bearer ")
+			log.Debugf("BootstrapMCPConnect: Using bootstrap token from Authorization header")
 		}
 	}
 
 	if bootstrapTokenHeader == "" {
-		log.Warnf("BootstrapMCPConnect: No bootstrap token provided")
+		log.Warnf("BootstrapMCPConnect: No bootstrap token provided. Headers present: %v", headerNames)
 		req.ResponseWriter.Header().Set("WWW-Authenticate", `Bearer error="invalid_token", error_description="OBOT_BOOTSTRAP_TOKEN required"`)
 		http.Error(req.ResponseWriter, "unauthorized: OBOT_BOOTSTRAP_TOKEN required", http.StatusUnauthorized)
 		return nil
 	}
+	
+	log.Debugf("BootstrapMCPConnect: Bootstrap token found (length: %d)", len(bootstrapTokenHeader))
 
 	// Get the bootstrap token from credentials to validate
 	bootstrapTokenCred, err := h.gptClient.RevealCredential(req.Context(), []string{"obot-bootstrap"}, "obot-bootstrap")
