@@ -15,6 +15,7 @@ COPY . .
 RUN --mount=type=cache,target=/root/.cache/go-build \
   --mount=type=cache,target=/root/.cache/uv \
   --mount=type=cache,target=/root/go/pkg/mod \
+  go mod tidy && \
   make build
 
 FROM cgr.dev/chainguard/wolfi-base:latest AS final-base
