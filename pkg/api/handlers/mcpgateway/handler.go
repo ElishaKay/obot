@@ -409,6 +409,7 @@ func (h *Handler) onMessage(ctx context.Context, msg nmcp.Message, m messageCont
 			m.mcpServer.Spec.MCPServerCatalogEntryName,
 			catalogName,
 			powerUserWorkspaceID,
+			m.serverConfig,
 		),
 	)
 	if err != nil {
@@ -912,6 +913,25 @@ func (h *Handler) BootstrapMCPConnect(req api.Context) error {
 
 	log.Infof("BootstrapMCPConnect: Successfully retrieved MCP server config: mcpID=%s, serverName=%s, runtime=%s", mcpID, mcpServer.Name, mcpServer.Spec.Manifest.Runtime)
 
+	// For remote servers pointing to bootstrap endpoints, add the bootstrap token to headers
+	// This ensures that when the MCP client connects to the remote server, it authenticates properly
+	if mcpServerConfig.Runtime == types.RuntimeRemote && strings.Contains(mcpServerConfig.URL, "/mcp-bootstrap/") {
+		// Check if OBOT_BOOTSTRAP_TOKEN header is already present
+		hasBootstrapToken := false
+		for _, header := range mcpServerConfig.Headers {
+			if strings.HasPrefix(header, "OBOT_BOOTSTRAP_TOKEN=") || strings.HasPrefix(header, "Authorization=") {
+				hasBootstrapToken = true
+				break
+			}
+		}
+		
+		if !hasBootstrapToken {
+			// Add the bootstrap token to the headers
+			mcpServerConfig.Headers = append(mcpServerConfig.Headers, fmt.Sprintf("OBOT_BOOTSTRAP_TOKEN=%s", bootstrapTokenHeader))
+			log.Debugf("BootstrapMCPConnect: Added bootstrap token to headers for remote server: %s", mcpServerConfig.URL)
+		}
+	}
+
 	messageCtx := messageContext{
 		userID:       ownerUserInfo.GetUID(),
 		mcpID:        mcpID,
@@ -969,6 +989,21 @@ func (h *Handler) BootstrapMCPConnect(req api.Context) error {
 				continue
 			}
 
+			// For remote component servers pointing to bootstrap endpoints, add the bootstrap token to headers
+			if config.Runtime == types.RuntimeRemote && strings.Contains(config.URL, "/mcp-bootstrap/") {
+				hasBootstrapToken := false
+				for _, header := range config.Headers {
+					if strings.HasPrefix(header, "OBOT_BOOTSTRAP_TOKEN=") || strings.HasPrefix(header, "Authorization=") {
+						hasBootstrapToken = true
+						break
+					}
+				}
+				if !hasBootstrapToken {
+					config.Headers = append(config.Headers, fmt.Sprintf("OBOT_BOOTSTRAP_TOKEN=%s", bootstrapTokenHeader))
+					log.Debugf("BootstrapMCPConnect: Added bootstrap token to headers for component server: %s", config.URL)
+				}
+			}
+
 			componentServers = append(componentServers, messageContext{
 				userID:       ownerUserInfo.GetUID(),
 				mcpID:        srv.Name,
@@ -993,6 +1028,21 @@ func (h *Handler) BootstrapMCPConnect(req api.Context) error {
 			if err != nil {
 				log.Warnf("Failed to get multi-user server %s: %v", multiUserServer.Name, err)
 				continue
+			}
+
+			// For remote component servers pointing to bootstrap endpoints, add the bootstrap token to headers
+			if config.Runtime == types.RuntimeRemote && strings.Contains(config.URL, "/mcp-bootstrap/") {
+				hasBootstrapToken := false
+				for _, header := range config.Headers {
+					if strings.HasPrefix(header, "OBOT_BOOTSTRAP_TOKEN=") || strings.HasPrefix(header, "Authorization=") {
+						hasBootstrapToken = true
+						break
+					}
+				}
+				if !hasBootstrapToken {
+					config.Headers = append(config.Headers, fmt.Sprintf("OBOT_BOOTSTRAP_TOKEN=%s", bootstrapTokenHeader))
+					log.Debugf("BootstrapMCPConnect: Added bootstrap token to headers for component instance: %s", config.URL)
+				}
 			}
 
 			componentServers = append(componentServers, messageContext{

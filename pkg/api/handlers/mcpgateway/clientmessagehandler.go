@@ -12,12 +12,13 @@ import (
 	"github.com/google/uuid"
 	"github.com/gptscript-ai/go-gptscript"
 	nmcp "github.com/nanobot-ai/nanobot/pkg/mcp"
+	"github.com/obot-platform/obot/apiclient/types"
 	gateway "github.com/obot-platform/obot/pkg/gateway/client"
 	gatewaytypes "github.com/obot-platform/obot/pkg/gateway/types"
 	"github.com/obot-platform/obot/pkg/mcp"
 )
 
-func (h *Handler) asClientOption(session *nmcp.Session, userID, mcpID, mcpServerNamespace, mcpServerName, serverDisplayName, serverCatalogEntryName, serverCatalogName, powerUserWorkspaceID string) nmcp.ClientOption {
+func (h *Handler) asClientOption(session *nmcp.Session, userID, mcpID, mcpServerNamespace, mcpServerName, serverDisplayName, serverCatalogEntryName, serverCatalogName, powerUserWorkspaceID string, serverConfig mcp.ServerConfig) nmcp.ClientOption {
 	ch := &clientMessageHandler{
 		webhookHelper:   h.webhookHelper,
 		gptClient:       h.gptClient,
@@ -36,9 +37,19 @@ func (h *Handler) asClientOption(session *nmcp.Session, userID, mcpID, mcpServer
 		},
 	}
 
+	// For remote servers pointing to bootstrap endpoints, skip token storage
+	// The bootstrap token is already in the headers, and OAuth won't work for bootstrap endpoints
+	var tokenStorage nmcp.TokenStorage
+	if serverConfig.Runtime == types.RuntimeRemote && strings.Contains(serverConfig.URL, "/mcp-bootstrap/") {
+		// Skip token storage for bootstrap endpoints - authentication is handled via headers
+		tokenStorage = nil
+	} else {
+		tokenStorage = h.tokenStore.ForUserAndMCP(userID, mcpID)
+	}
+
 	opts := nmcp.ClientOption{
 		ClientName:   "Obot MCP Gateway",
-		TokenStorage: h.tokenStore.ForUserAndMCP(userID, mcpID),
+		TokenStorage: tokenStorage,
 		OnMessage:    ch.onMessage,
 	}
 
