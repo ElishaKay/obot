@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
@@ -93,6 +94,74 @@ func (ss *sessionStore) Acquire(ctx context.Context, server nmcp.MessageHandler,
 	if err != nil {
 		return nil, false, fmt.Errorf("failed to get session %s from cache: %w", sessionID, err)
 	} else if mcpSess == nil {
+		// Session doesn't exist - try to create it for stateless HTTP requests
+		// Check if we have server config from the message context
+		if msgCtx, ok := messageContextFromContext(ctx); ok && msgCtx.serverConfig.Command != "" {
+			// We have server config, create a new session
+			// Convert server config to nmcp.Server format
+			envMap := make(map[string]string, len(msgCtx.serverConfig.Env))
+			for _, s := range msgCtx.serverConfig.Env {
+				k, v, ok := strings.Cut(s, "=")
+				if ok {
+					envMap[k] = v
+				}
+			}
+			headersMap := make(map[string]string, len(msgCtx.serverConfig.Headers))
+			for _, s := range msgCtx.serverConfig.Headers {
+				k, v, ok := strings.Cut(s, "=")
+				if ok {
+					headersMap[k] = v
+				}
+			}
+			
+			// Create a new empty session state
+			emptyState := nmcp.SessionState{
+				ID: sessionID,
+			}
+			
+			// Create a new server session from the empty state
+			newSess, err := nmcp.NewExistingServerSession(ctx, emptyState, server)
+			if err != nil {
+				// If we can't create from empty state, try creating a new session
+				// The HTTP server will handle initialization
+				return nil, false, nil
+			}
+			
+			// Create the MCP session record
+			mcpSess = &v1.MCPSession{
+				ObjectMeta: metav1.ObjectMeta{
+					Namespace:  system.DefaultNamespace,
+					Name:       sessionID,
+					Finalizers: []string{v1.MCPSessionFinalizer},
+				},
+				Spec: v1.MCPSessionSpec{
+					MCPID:  ss.mcpID,
+					UserID: ss.userID,
+				},
+				Status: v1.MCPSessionStatus{
+					LastUsedTime: metav1.Now(),
+				},
+			}
+			
+			// Store the session state
+			stateBytes, err := json.Marshal(emptyState)
+			if err == nil {
+				mcpSess.Spec.State = stateBytes
+			}
+			
+			// Create the session in storage
+			if err := create.OrUpdate(ctx, ss.storageClient, mcpSess); err != nil {
+				return nil, false, fmt.Errorf("failed to create session %s: %w", sessionID, err)
+			}
+			
+			// Cache the session
+			ss.mcpSessionCache.Store(sessionID, mcpSess)
+			ss.sessionCache.Store(sessionID, newSess)
+			
+			return newSess, true, nil
+		}
+		
+		// No server config available, return nil
 		return nil, false, nil
 	}
 

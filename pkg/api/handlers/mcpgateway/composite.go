@@ -159,6 +159,7 @@ func (h *Handler) onCompositeMessage(ctx context.Context, msg nmcp.Message, m me
 				componentServer.mcpServer.Spec.MCPServerCatalogEntryName,
 				catalogName,
 				powerUserWorkspaceID,
+				componentServer.serverConfig,
 			),
 		)
 		if err != nil {

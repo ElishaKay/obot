@@ -3,6 +3,7 @@ package router
 import (
 	"context"
 	"net/http"
+	"os"
 
 	"github.com/obot-platform/obot/pkg/api/handlers"
 	"github.com/obot-platform/obot/pkg/api/handlers/mcpgateway"
@@ -567,6 +568,14 @@ func Router(ctx context.Context, services *services.Services) (http.Handler, err
 	mux.HandleFunc("DELETE /api/mcp-webhook-validations/{mcp_webhook_validation_id}/secret", mcpWebhookValidations.RemoveSecret)
 
 	// MCP Gateway Endpoints
+	// GET endpoint for MCP server configuration (for bootstrap token access)
+	mux.HandleFunc("GET /mcp-connect/{mcp_id}", mcpGateway.GetMCPConfig)
+	// Bootstrap-only MCP endpoint (bypasses OAuth and authorization checks)
+	// Handle both base path and sub-paths (e.g., /mcp-bootstrap/{mcp_id}/list_rags)
+	// Use a prefix match to catch all sub-paths
+	mux.HandleFunc("/mcp-bootstrap/{mcp_id}", mcpGateway.BootstrapMCPConnect)
+	mux.HandleFunc("/mcp-bootstrap/{mcp_id}/{path...}", mcpGateway.BootstrapMCPConnect)
+	// WebSocket/SSE endpoint for MCP protocol communication
 	mux.HandleFunc("/mcp-connect/{mcp_id}", mcpGateway.StreamableHTTP)
 
 	// MCP Audit Logs
@@ -724,7 +733,15 @@ func Router(ctx context.Context, services *services.Services) (http.Handler, err
 	// Gateway APIs
 	services.GatewayServer.AddRoutes(services.APIServer)
 
-	services.APIServer.HTTPHandle("/", ui.Handler(services.DevUIPort, services.UserUIPort))
+	// Get the working directory for UI files (empty if proxying to separate processes)
+	var uiBasePath string
+	if services.DevUIPort == 0 && services.UserUIPort == 0 {
+		// Try to find UI files relative to the binary
+		if wd, err := os.Getwd(); err == nil {
+			uiBasePath = wd
+		}
+	}
+	services.APIServer.HTTPHandle("/", ui.Handler(services.DevUIPort, services.UserUIPort, uiBasePath, services.AdminUIHost, services.UserUIHost))
 
 	return services.APIServer, nil
 }

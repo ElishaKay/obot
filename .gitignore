@@ -1,5 +1,6 @@
 # Ignore binary files
 bin/
+.pnpm-store/
 
 # Random TLS files
 apiserver.local.config/
@@ -8,6 +9,11 @@ kubeconfig
 
 # Ignore envrc
 .envrc
+
+# Ignore environment files
+.env
+.env.local
+.env.*.local
 
 # Ignore any compiled Go binaries
 *.exe

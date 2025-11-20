@@ -69,6 +69,25 @@ func (sm *SessionManager) clientForServerWithOptions(ctx context.Context, userID
 		return nil, err
 	}
 
+	// For bootstrap users or remote servers pointing to bootstrap endpoints, ensure token storage is nil
+	// This prevents OAuth authentication attempts when using bootstrap token headers
+	isBootstrapUser := userID == "bootstrap"
+	isBootstrapEndpoint := (config.Runtime == types.RuntimeRemote && strings.Contains(config.URL, "/mcp-bootstrap/")) ||
+		(serverConfig.Runtime == types.RuntimeRemote && strings.Contains(serverConfig.URL, "/mcp-bootstrap/"))
+	
+	if isBootstrapUser || isBootstrapEndpoint {
+		// Merge options and ensure TokenStorage is nil for bootstrap endpoints
+		// We need to override any existing TokenStorage setting
+		mergedOpts := make([]nmcp.ClientOption, 0, len(opts)+1)
+		mergedOpts = append(mergedOpts, opts...)
+		// Add an option to explicitly set TokenStorage to nil, overriding any previous setting
+		// The last option in the slice will override previous ones
+		mergedOpts = append(mergedOpts, nmcp.ClientOption{
+			TokenStorage: nil,
+		})
+		opts = mergedOpts
+	}
+
 	session, err := sm.loadSession(config, clientScope, mcpServerDisplayName, opts...)
 	if err != nil {
 		return nil, err

@@ -139,20 +139,45 @@ func (b *Bootstrap) AuthenticateRequest(req *http.Request) (*authenticator.Respo
 		return nil, false, nil
 	}
 
-	authHeader := req.Header.Get("Authorization")
-	if authHeader == "" {
-		// Check for the cookie.
-		c, err := req.Cookie(ObotBootstrapCookie)
-		if err != nil || c.Value != b.token {
-			return nil, false, nil
+	var tokenMatch bool
+	var isHeaderAuth bool
+	// Check for OBOT_BOOTSTRAP_TOKEN header first
+	bootstrapTokenHeader := req.Header.Get("OBOT_BOOTSTRAP_TOKEN")
+	if bootstrapTokenHeader != "" {
+		tokenMatch = bootstrapTokenHeader == b.token
+		isHeaderAuth = true
+	} else {
+		// Fall back to Authorization header
+		authHeader := req.Header.Get("Authorization")
+		if authHeader != "" {
+			tokenMatch = authHeader == fmt.Sprintf("Bearer %s", b.token)
+			isHeaderAuth = true
+		} else {
+			// Check for the cookie.
+			c, err := req.Cookie(ObotBootstrapCookie)
+			if err == nil && c.Value == b.token {
+				tokenMatch = true
+				isHeaderAuth = false
+			}
 		}
-	} else if authHeader != fmt.Sprintf("Bearer %s", b.token) {
+	}
+
+	if !tokenMatch {
 		return nil, false, nil
 	}
 
-	// Deny authentication if bootstrap is not enabled.
-	if enabled, err := b.bootstrapEnabled(req.Context()); !enabled || err != nil {
-		return nil, false, err
+	// For header-based authentication (OBOT_BOOTSTRAP_TOKEN or Authorization: Bearer),
+	// allow authentication even when bootstrap is not enabled (i.e., when admins exist).
+	// This enables programmatic MCP access while keeping UI bootstrap login restricted.
+	// Cookie-based authentication still requires bootstrap to be enabled.
+	if isHeaderAuth {
+		// Header-based auth: allow even if bootstrap is not enabled
+		// This enables MCP access via token headers even when admins exist
+	} else {
+		// Cookie-based auth: require bootstrap to be enabled (for UI login)
+		if enabled, err := b.bootstrapEnabled(req.Context()); !enabled || err != nil {
+			return nil, false, err
+		}
 	}
 
 	gatewayUser, err := b.gatewayClient.EnsureIdentityWithRole(
