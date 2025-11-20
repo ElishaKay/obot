@@ -131,8 +131,66 @@ func (e *Emitter) SubmitProgress(run *v1.Run, progress types.Progress) {
 }
 
 func (e *Emitter) findRunByThreadName(ctx context.Context, threadNamespace, threadName, resourceVersion string) (*v1.Run, error) {
-	var run v1.Run
+	// First, try to get the thread directly and check its status
+	var thread v1.Thread
+	if err := e.client.Get(ctx, router.Key(threadNamespace, threadName), &thread); err == nil {
+		// Check if thread already has a run name in status (check CurrentRunName first, then LastRunName)
+		if thread.Status.CurrentRunName != "" {
+			var run v1.Run
+			if err := e.client.Get(ctx, router.Key(thread.Namespace, thread.Status.CurrentRunName), &run); err == nil {
+				log.Debugf("findRunByThreadName: found run via thread.CurrentRunName: thread=%s, run=%s", threadName, run.Name)
+				return &run, nil
+			}
+		}
+		if thread.Status.LastRunName != "" {
+			var run v1.Run
+			if err := e.client.Get(ctx, router.Key(thread.Namespace, thread.Status.LastRunName), &run); err == nil {
+				log.Debugf("findRunByThreadName: found run via thread.LastRunName: thread=%s, run=%s", threadName, run.Name)
+				return &run, nil
+			}
+		}
+	}
 
+	// Second, try to directly query for runs with this thread name
+	// This is more reliable in Docker environments where watches might not work as expected
+	// Retry a few times in case the run was just created and isn't immediately available
+	maxRetries := 5
+	retryDelay := 100 * time.Millisecond
+	for attempt := 0; attempt < maxRetries; attempt++ {
+		var runList v1.RunList
+		if err := e.client.List(ctx, &runList, kclient.InNamespace(threadNamespace),
+			kclient.MatchingFields{"spec.threadName": threadName}); err == nil {
+			if len(runList.Items) > 0 {
+				// Return the most recent run (runs are typically ordered by creation time)
+				// Prefer runs that are not finished/error (i.e., still running)
+				for i := len(runList.Items) - 1; i >= 0; i-- {
+					run := runList.Items[i]
+					if run.Status.State != v1.Finished && run.Status.State != v1.Error {
+						log.Debugf("findRunByThreadName: found active run via query: thread=%s, run=%s, state=%s", threadName, run.Name, run.Status.State)
+						return &run, nil
+					}
+				}
+				// If all runs are done, return the most recent one
+				mostRecent := &runList.Items[len(runList.Items)-1]
+				log.Debugf("findRunByThreadName: found completed run via query: thread=%s, run=%s, state=%s", threadName, mostRecent.Name, mostRecent.Status.State)
+				return mostRecent, nil
+			}
+		}
+		
+		// If no runs found and not the last attempt, wait a bit and retry
+		if attempt < maxRetries-1 {
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-time.After(retryDelay):
+				// Continue to next attempt
+			}
+			retryDelay *= 2 // Exponential backoff
+		}
+	}
+
+	// Third, fall back to watching the thread for updates
+	// This is the original Kubernetes-style watch approach
 	w, err := e.client.Watch(ctx, &v1.ThreadList{}, kclient.InNamespace(threadNamespace),
 		kclient.MatchingFields{"metadata.name": threadName}, &kclient.ListOptions{
 			Raw: &metav1.ListOptions{
@@ -152,6 +210,7 @@ func (e *Emitter) findRunByThreadName(ctx context.Context, threadNamespace, thre
 	for event := range w.ResultChan() {
 		if thread, ok := event.Object.(*v1.Thread); ok {
 			if thread.Status.CurrentRunName != "" {
+				var run v1.Run
 				if err := e.client.Get(ctx, router.Key(thread.Namespace, thread.Status.CurrentRunName), &run); err != nil && !apierrors.IsNotFound(err) {
 					return nil, err
 				} else if err == nil {
@@ -159,6 +218,7 @@ func (e *Emitter) findRunByThreadName(ctx context.Context, threadNamespace, thre
 				}
 			}
 			if thread.Status.LastRunName != "" {
+				var run v1.Run
 				if err := e.client.Get(ctx, router.Key(thread.Namespace, thread.Status.LastRunName), &run); err != nil && !apierrors.IsNotFound(err) {
 					return nil, err
 				} else if err == nil {

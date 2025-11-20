@@ -439,6 +439,17 @@ func New(ctx context.Context, config Config) (*Services, error) {
 		config.MCPAuditLogsPersistBatchSize)
 	mcpOAuthTokenStorage := mcpgateway.NewGlobalTokenStore(gatewayClient)
 
+	// Set MCPRuntimeBackend from MCPConfig if not already set
+	// This allows it to be read from environment variables via MCPConfig
+	if config.MCPRuntimeBackend == "" {
+		config.MCPRuntimeBackend = config.MCPConfig.MCPRuntimeBackend
+	}
+	// Default to "docker" if still not set
+	if config.MCPRuntimeBackend == "" {
+		config.MCPRuntimeBackend = "docker"
+	}
+	slog.Info("MCP Runtime Backend configured", "backend", config.MCPRuntimeBackend)
+
 	// Build local Kubernetes config for deployment monitoring (optional)
 	var localK8sConfig *rest.Config
 	if config.MCPRuntimeBackend == "kubernetes" {
@@ -632,6 +643,7 @@ func New(ctx context.Context, config Config) (*Services, error) {
 			config.HTTPListenPort,
 			ephemeralTokenServer,
 			events,
+			config.MCPRuntimeBackend,
 		)
 		providerDispatcher = dispatcher.New(ctx, invoker, storageClient, gptscriptClient, gatewayClient, postgresDSN)
 

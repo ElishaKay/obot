@@ -3,10 +3,12 @@ package invoke
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"maps"
+	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -55,9 +57,16 @@ type Invoker struct {
 	events            *events.Emitter
 	serverURL         string
 	internalServerURL string
+	mcpRuntimeBackend string
 }
 
-func NewInvoker(c kclient.WithWatch, gptClient *gptscript.GPTScript, gatewayClient *client.Client, mcpSessionManager *mcp.SessionManager, serverURL string, serverPort int, tokenService *ephemeral.TokenService, events *events.Emitter) *Invoker {
+func NewInvoker(c kclient.WithWatch, gptClient *gptscript.GPTScript, gatewayClient *client.Client, mcpSessionManager *mcp.SessionManager, serverURL string, serverPort int, tokenService *ephemeral.TokenService, events *events.Emitter, mcpRuntimeBackend string) *Invoker {
+	// Allow internal server URL to be configured via environment variable
+	// This is important for Docker setups where localhost might not work correctly
+	internalServerURL := os.Getenv("OBOT_INTERNAL_SERVER_URL")
+	if internalServerURL == "" {
+		internalServerURL = fmt.Sprintf("http://localhost:%d", serverPort)
+	}
 	return &Invoker{
 		uncached:          c,
 		gptClient:         gptClient,
@@ -66,7 +75,8 @@ func NewInvoker(c kclient.WithWatch, gptClient *gptscript.GPTScript, gatewayClie
 		mcpSessionManager: mcpSessionManager,
 		events:            events,
 		serverURL:         serverURL,
-		internalServerURL: fmt.Sprintf("http://localhost:%d", serverPort),
+		internalServerURL: internalServerURL,
+		mcpRuntimeBackend: mcpRuntimeBackend,
 	}
 }
 
@@ -337,20 +347,31 @@ func (i *Invoker) Thread(ctx context.Context, c kclient.WithWatch, thread *v1.Th
 }
 
 func (i *Invoker) Agent(ctx context.Context, c kclient.WithWatch, agent *v1.Agent, input string, opt Options) (*Response, error) {
+	log.Debugf("Agent: starting invocation: agent=%s, inputLength=%d, userID=%s, synchronous=%v", 
+		agent.Name, len(input), opt.UserUID, opt.Synchronous)
 	thread := opt.Thread
 	if thread == nil {
+		log.Debugf("Agent: thread not provided, getting thread for agent: agent=%s", agent.Name)
 		var err error
 		thread, err = getThreadForAgent(ctx, c, agent, opt)
 		if err != nil {
+			log.Errorf("Agent: failed to get thread for agent: agent=%s, error=%v", agent.Name, err)
 			return nil, err
 		}
+		log.Debugf("Agent: got thread: agent=%s, thread=%s", agent.Name, thread.Name)
+	} else {
+		log.Debugf("Agent: using provided thread: agent=%s, thread=%s", agent.Name, thread.Name)
 	}
 
 	if thread.Spec.AgentName != agent.Name {
+		log.Errorf("Agent: thread-agent mismatch: thread=%s, threadAgent=%s, requestedAgent=%s", 
+			thread.Name, thread.Spec.AgentName, agent.Name)
 		return nil, fmt.Errorf("thread %q is not associated with agent %q", thread.Name, agent.Name)
 	}
 
+	log.Debugf("Agent: un-aborting thread if needed: thread=%s", thread.Name)
 	if err := unAbortThread(ctx, c, thread); err != nil {
+		log.Errorf("Agent: failed to un-abort thread: thread=%s, error=%v", thread.Name, err)
 		return nil, err
 	}
 
@@ -377,6 +398,7 @@ func (i *Invoker) Agent(ctx context.Context, c kclient.WithWatch, agent *v1.Agen
 		}
 	}
 
+	log.Debugf("Agent: rendering agent: thread=%s, agent=%s", thread.Name, agent.Name)
 	renderedAgent, err := render.Agent(ctx, i.tokenService, i.mcpSessionManager, c, agent, i.serverURL, i.internalServerURL, render.AgentOptions{
 		Thread:          thread,
 		WorkflowStepID:  opt.WorkflowStepID,
@@ -384,8 +406,11 @@ func (i *Invoker) Agent(ctx context.Context, c kclient.WithWatch, agent *v1.Agen
 		IgnoreMCPErrors: opt.IgnoreMCPErrors,
 	})
 	if err != nil {
+		log.Errorf("Agent: failed to render agent: thread=%s, agent=%s, error=%v", thread.Name, agent.Name, err)
 		return nil, err
 	}
+	log.Debugf("Agent: agent rendered successfully: thread=%s, agent=%s, toolCount=%d", 
+		thread.Name, agent.Name, len(renderedAgent.Tools))
 
 	if len(agent.Spec.Manifest.Params) == 0 {
 		data := map[string]any{}
@@ -396,6 +421,7 @@ func (i *Invoker) Agent(ctx context.Context, c kclient.WithWatch, agent *v1.Agen
 		}
 	}
 
+	log.Debugf("Thread: creating run for thread=%s, agent=%s, synchronous=%v", thread.Name, agent.Name, opt.Synchronous)
 	resp, err := i.createRun(ctx, c, thread, renderedAgent.Tools, input, runOptions{
 		Synchronous:           opt.Synchronous,
 		WorkflowName:          opt.WorkflowName,
@@ -451,7 +477,10 @@ func isEphemeral(run *v1.Run) bool {
 }
 
 func (i *Invoker) createRun(ctx context.Context, c kclient.WithWatch, thread *v1.Thread, tool any, input string, opts runOptions) (*Response, error) {
+	log.Debugf("createRun: starting for thread=%s, ephemeral=%v, project=%v, systemTask=%v, synchronous=%v, agent=%s, mcpRuntimeBackend=%s", 
+		thread.Name, opts.Ephemeral, thread.Spec.Project, thread.Spec.SystemTask, opts.Synchronous, opts.AgentName, i.mcpRuntimeBackend)
 	if thread.Spec.Project && !opts.Ephemeral {
+		log.Errorf("createRun: BLOCKED - project threads cannot be invoked: thread=%s", thread.Name)
 		return nil, fmt.Errorf("project threads cannot be invoked")
 	}
 
@@ -466,8 +495,10 @@ func (i *Invoker) createRun(ctx context.Context, c kclient.WithWatch, thread *v1
 
 	toolData, err := json.Marshal(tool)
 	if err != nil {
+		log.Errorf("createRun: failed to marshal tool: thread=%s, error=%v", thread.Name, err)
 		return nil, err
 	}
+	log.Debugf("createRun: tool marshaled successfully: thread=%s, toolSize=%d", thread.Name, len(toolData))
 
 	generateName := opts.GenerateName
 	if generateName == "" {
@@ -500,34 +531,93 @@ func (i *Invoker) createRun(ctx context.Context, c kclient.WithWatch, thread *v1
 	if opts.UserID != "" {
 		u, err := i.gatewayClient.UserByID(ctx, opts.UserID)
 		if err != nil {
+			log.Errorf("createRun: failed to get user: thread=%s, userID=%s, error=%v", thread.Name, opts.UserID, err)
 			return nil, err
 		}
 		run.Spec.Username = u.DisplayName
+		log.Debugf("createRun: user retrieved: thread=%s, userID=%s, username=%s", thread.Name, opts.UserID, u.DisplayName)
 	}
 
 	if opts.Ephemeral {
 		run.Name = fmt.Sprintf("%s-%d", ephemeralRunPrefix, ephemeralCounter.Add(1))
+		log.Debugf("createRun: using ephemeral run name: thread=%s, runName=%s", thread.Name, run.Name)
 	} else {
+		// For Docker runtime backend, generate the name manually instead of relying on GenerateName
+		// This is because the storage backend might not handle GenerateName the same way as Kubernetes
+		log.Debugf("createRun: Creating run with MCPRuntimeBackend=%s, GenerateName=%s, thread=%s", i.mcpRuntimeBackend, generateName, thread.Name)
+		if i.mcpRuntimeBackend == "docker" {
+			// Generate a unique name similar to how Kubernetes GenerateName works
+			// Kubernetes appends a random 5-character suffix to the GenerateName prefix
+			randomBytes := make([]byte, 5)
+			if _, err := rand.Read(randomBytes); err != nil {
+				log.Errorf("createRun: failed to generate random name: thread=%s, error=%v", thread.Name, err)
+				return nil, fmt.Errorf("failed to generate random name: %w", err)
+			}
+			randomSuffix := fmt.Sprintf("%x", randomBytes)[:10] // Take first 10 chars (5 bytes = 10 hex chars)
+			// Append the suffix to the generateName prefix, similar to Kubernetes behavior
+			run.Name = fmt.Sprintf("%s-%s", generateName, randomSuffix)
+			// Remove the GenerateName since we're setting Name directly
+			run.GenerateName = ""
+			log.Debugf("createRun: Generated run name for Docker backend: thread=%s, runName=%s (from GenerateName: %s)", thread.Name, run.Name, generateName)
+		}
+		
+		log.Debugf("createRun: About to create run in storage (Docker/PostgreSQL backend): thread=%s, runName=%s, namespace=%s, mcpRuntimeBackend=%s", 
+			thread.Name, run.Name, run.Namespace, i.mcpRuntimeBackend)
 		if err := c.Create(ctx, &run); err != nil {
+			log.Errorf("createRun: FAILED to create run in storage (Docker/PostgreSQL backend): thread=%s, runName=%s, namespace=%s, mcpRuntimeBackend=%s, error=%v, errorType=%T", 
+				thread.Name, run.Name, run.Namespace, i.mcpRuntimeBackend, err, err)
 			return nil, err
+		}
+		log.Infof("createRun: Run successfully created in storage (Docker/PostgreSQL backend): thread=%s, runName=%s, namespace=%s, mcpRuntimeBackend=%s", 
+			thread.Name, run.Name, run.Namespace, i.mcpRuntimeBackend)
+		
+		// After Create, Kubernetes should have set the name from GenerateName (if not Docker)
+		// For Docker, we set the name manually above
+		// Log a warning if it's still empty (shouldn't happen, but helps debug)
+		if run.Name == "" {
+			log.Errorf("createRun: CRITICAL - Run created but name is empty after Create. thread=%s, GenerateName=%s, MCPRuntimeBackend=%s", 
+				thread.Name, generateName, i.mcpRuntimeBackend)
+		} else {
+			log.Debugf("createRun: Run created with name: thread=%s, runName=%s, MCPRuntimeBackend=%s", thread.Name, run.Name, i.mcpRuntimeBackend)
+			
+			// Verify the run actually exists in storage (important for Docker/PostgreSQL)
+			var verifyRun v1.Run
+			if err := c.Get(ctx, kclient.ObjectKey{Namespace: run.Namespace, Name: run.Name}, &verifyRun); err != nil {
+				log.Errorf("createRun: CRITICAL - Run created but cannot be retrieved from storage (Docker/PostgreSQL): thread=%s, runName=%s, namespace=%s, error=%v", 
+					thread.Name, run.Name, run.Namespace, err)
+			} else {
+				log.Debugf("createRun: Run verified in storage: thread=%s, runName=%s, namespace=%s", thread.Name, run.Name, run.Namespace)
+			}
 		}
 	}
 
 	if !thread.Spec.SystemTask && !opts.Ephemeral {
+		log.Debugf("createRun: Updating thread status: thread=%s, runName=%s, systemTask=%v, ephemeral=%v", 
+			thread.Name, run.Name, thread.Spec.SystemTask, opts.Ephemeral)
 		err = retry.RetryOnConflict(retry.DefaultBackoff, func() error {
 			if err := i.uncached.Get(ctx, kclient.ObjectKeyFromObject(thread), thread); err != nil {
+				log.Errorf("createRun: failed to get thread for status update: thread=%s, runName=%s, error=%v", thread.Name, run.Name, err)
 				return err
 			}
 			thread.Status.CurrentRunName = run.Name
 			if err := retention.SetLastUsedTime(ctx, c, thread); err != nil {
+				log.Errorf("createRun: failed to set last used time: thread=%s, runName=%s, error=%v", thread.Name, run.Name, err)
 				return err
 			}
+			log.Debugf("createRun: About to update thread status: thread=%s, runName=%s, currentRunName=%s", 
+				thread.Name, run.Name, thread.Status.CurrentRunName)
 			return c.Status().Update(ctx, thread)
 		})
 		if err != nil {
 			// Don't return error it's not critical, and will mostly likely make caller loose track of this
-			log.Errorf("failed to update thread %q for run %q: %v", thread.Name, run.Name, err)
+			log.Errorf("createRun: FAILED to update thread status (non-critical): thread=%s, runName=%s, error=%v, errorType=%T", 
+				thread.Name, run.Name, err, err)
+		} else {
+			log.Infof("createRun: Thread status successfully updated: thread=%s, CurrentRunName=%s", thread.Name, run.Name)
 		}
+	} else {
+		log.Debugf("createRun: Skipping thread status update: thread=%s, runName=%s, systemTask=%v, ephemeral=%v", 
+			thread.Name, run.Name, thread.Spec.SystemTask, opts.Ephemeral)
 	}
 
 	resp := &Response{
@@ -536,6 +626,7 @@ func (i *Invoker) createRun(ctx context.Context, c kclient.WithWatch, thread *v1
 	}
 
 	if !opts.Synchronous {
+		log.Debugf("createRun: Returning async response: thread=%s, runName=%s", thread.Name, run.Name)
 		noEvents := make(chan types.Progress)
 		close(noEvents)
 		resp.Events = noEvents
@@ -543,28 +634,39 @@ func (i *Invoker) createRun(ctx context.Context, c kclient.WithWatch, thread *v1
 		return resp, nil
 	}
 
+	log.Debugf("createRun: Setting up synchronous run: thread=%s, runName=%s", thread.Name, run.Name)
 	ctx, cancel := context.WithCancel(ctx)
 
 	_, events, err := i.events.Watch(ctx, thread.Namespace, events.WatchOptions{
 		Run: &run,
 	})
 	if err != nil {
+		log.Errorf("createRun: FAILED to watch events for run: thread=%s, runName=%s, error=%v, errorType=%T", 
+			thread.Name, run.Name, err, err)
 		cancel()
 		// Cleanup orphaned run
-		_ = i.uncached.Delete(ctx, &run)
+		log.Debugf("createRun: Cleaning up orphaned run: thread=%s, runName=%s", thread.Name, run.Name)
+		if delErr := i.uncached.Delete(ctx, &run); delErr != nil {
+			log.Errorf("createRun: Failed to cleanup orphaned run: thread=%s, runName=%s, error=%v", thread.Name, run.Name, delErr)
+		}
 		return nil, err
 	}
+	log.Debugf("createRun: Events watch started successfully: thread=%s, runName=%s", thread.Name, run.Name)
 
 	resp.Events = events
 	resp.uncached = i.uncached
 	resp.gatewayClient = i.gatewayClient
 	resp.cancel = cancel
+	log.Debugf("createRun: Starting Resume goroutine: thread=%s, runName=%s", thread.Name, run.Name)
 	go func() {
 		if err := i.Resume(ctx, c, thread, &run); err != nil {
-			log.Errorf("run failed: %v", err)
+			log.Errorf("createRun: Resume failed: thread=%s, runName=%s, error=%v, errorType=%T", thread.Name, run.Name, err, err)
+		} else {
+			log.Debugf("createRun: Resume completed successfully: thread=%s, runName=%s", thread.Name, run.Name)
 		}
 	}()
 
+	log.Infof("createRun: Successfully returning response: thread=%s, runName=%s, synchronous=%v", thread.Name, run.Name, opts.Synchronous)
 	return resp, nil
 }
 
@@ -653,6 +755,12 @@ func (i *Invoker) Resume(ctx context.Context, c kclient.WithWatch, thread *v1.Th
 	project, err := projects.GetRoot(ctx, c, thread)
 	if err != nil {
 		return fmt.Errorf("failed to get root project: %w", err)
+	}
+
+	// Ensure run.Name is set before creating token
+	// If it's empty, this is a serious issue - the run wasn't created properly
+	if run.Name == "" {
+		return fmt.Errorf("run name is empty - run was not created properly")
 	}
 
 	token, err := i.tokenService.NewToken(ephemeral.TokenContext{
