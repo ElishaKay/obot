@@ -6,6 +6,7 @@ import (
 	"io/fs"
 	"net/http"
 	"net/http/httputil"
+	"os"
 	"path"
 	"strings"
 
@@ -17,12 +18,29 @@ var embedded embed.FS
 
 func Handler(devPort, userOnlyPort int) http.Handler {
 	server := &uiServer{}
+	
+	// Get UI hostnames from environment variables, default to "localhost"
+	adminUIHost := os.Getenv("OBOT_ADMIN_UI_HOST")
+	if adminUIHost == "" {
+		adminUIHost = os.Getenv("OBOT_UI_HOST")
+		if adminUIHost == "" {
+			adminUIHost = "localhost"
+		}
+	}
+	
+	userUIHost := os.Getenv("OBOT_USER_UI_HOST")
+	if userUIHost == "" {
+		userUIHost = os.Getenv("OBOT_UI_HOST")
+		if userUIHost == "" {
+			userUIHost = "localhost"
+		}
+	}
 
 	if userOnlyPort != 0 {
 		server.rp = &httputil.ReverseProxy{
 			Director: func(r *http.Request) {
 				r.URL.Scheme = "http"
-				r.URL.Host = fmt.Sprintf("localhost:%d", userOnlyPort)
+				r.URL.Host = fmt.Sprintf("%s:%d", userUIHost, userOnlyPort)
 			},
 		}
 		server.userOnly = true
@@ -31,9 +49,9 @@ func Handler(devPort, userOnlyPort int) http.Handler {
 			Director: func(r *http.Request) {
 				r.URL.Scheme = "http"
 				if strings.HasPrefix(r.URL.Path, "/legacy-admin") {
-					r.URL.Host = fmt.Sprintf("localhost:%d", devPort)
+					r.URL.Host = fmt.Sprintf("%s:%d", adminUIHost, devPort)
 				} else {
-					r.URL.Host = fmt.Sprintf("localhost:%d", devPort+1)
+					r.URL.Host = fmt.Sprintf("%s:%d", userUIHost, devPort+1)
 				}
 			},
 		}

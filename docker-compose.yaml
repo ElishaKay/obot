@@ -10,7 +10,16 @@ services:
       - /var/run/docker.sock:/var/run/docker.sock
     env_file:
       - .env
+    environment:
+      - OBOT_SERVER_ADMIN_UI_HOST=admin-ui
+      - OBOT_SERVER_USER_UI_HOST=user-ui
+      - OBOT_DEV_MODE=true
+    # depends_on:
+      # - admin-ui
+      # - user-ui
     restart: unless-stopped
+    networks:
+      - obot-network
 
   admin-ui:
     build:
