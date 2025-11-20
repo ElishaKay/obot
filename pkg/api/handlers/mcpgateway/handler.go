@@ -736,187 +736,72 @@ func (h *Handler) BootstrapMCPConnect(req api.Context) error {
 		return fmt.Errorf("mcp_id is required")
 	}
 
-	// Validate bootstrap token directly from request header
-	// Log all headers for debugging (but don't log values for security)
-	var headerNames []string
-	for name, values := range req.Request.Header {
-		headerNames = append(headerNames, fmt.Sprintf("%s (len=%d)", name, len(values)))
-		// Check if this looks like our bootstrap token header (case-insensitive)
-		if strings.EqualFold(name, "OBOT_BOOTSTRAP_TOKEN") || strings.EqualFold(name, "Obot-Bootstrap-Token") {
-			log.Debugf("BootstrapMCPConnect: Found potential bootstrap token header: %s with %d value(s)", name, len(values))
-		}
-	}
-	log.Debugf("BootstrapMCPConnect: Request headers: %v", headerNames)
-	
+	// Minimal bootstrap token validation
 	bootstrapTokenHeader := req.Request.Header.Get("OBOT_BOOTSTRAP_TOKEN")
 	if bootstrapTokenHeader == "" {
-		// Try case-insensitive lookup - Go's Header.Get should handle this, but let's be explicit
-		for name, values := range req.Request.Header {
-			if strings.EqualFold(name, "OBOT_BOOTSTRAP_TOKEN") {
-				if len(values) > 0 {
-					bootstrapTokenHeader = values[0]
-					log.Debugf("BootstrapMCPConnect: Found bootstrap token in header %s (case-insensitive lookup)", name)
-					break
-				}
-			}
-		}
-	} else {
-		log.Debugf("BootstrapMCPConnect: Found bootstrap token via Header.Get()")
-	}
-	
-	if bootstrapTokenHeader == "" {
-		// Try Authorization header as fallback
 		authHeader := req.Request.Header.Get("Authorization")
-		if authHeader != "" {
-			log.Debugf("BootstrapMCPConnect: Found Authorization header, checking for Bearer token")
-		}
 		if strings.HasPrefix(authHeader, "Bearer ") {
 			bootstrapTokenHeader = strings.TrimPrefix(authHeader, "Bearer ")
-			log.Debugf("BootstrapMCPConnect: Using bootstrap token from Authorization header")
 		}
 	}
 
 	if bootstrapTokenHeader == "" {
-		log.Warnf("BootstrapMCPConnect: No bootstrap token provided. Headers present: %v", headerNames)
 		req.ResponseWriter.Header().Set("WWW-Authenticate", `Bearer error="invalid_token", error_description="OBOT_BOOTSTRAP_TOKEN required"`)
 		http.Error(req.ResponseWriter, "unauthorized: OBOT_BOOTSTRAP_TOKEN required", http.StatusUnauthorized)
 		return nil
 	}
-	
-	log.Debugf("BootstrapMCPConnect: Bootstrap token found (length: %d)", len(bootstrapTokenHeader))
 
-	// Get the bootstrap token from credentials to validate
+	// Validate token
 	bootstrapTokenCred, err := h.gptClient.RevealCredential(req.Context(), []string{"obot-bootstrap"}, "obot-bootstrap")
-	var expectedToken string
 	if err != nil {
-		// If credential doesn't exist, try environment variable as fallback
-		if errors.As(err, &gptscript.ErrNotFound{}) {
-			// Try to get from environment variable (for cases where credential isn't stored yet)
-			// This is a fallback - normally the token should be in credentials
-			log.Debugf("BootstrapMCPConnect: Bootstrap token credential not found, this may be expected on first run")
-			// We'll validate against empty token which will fail, but at least we tried
-		} else {
-			log.Errorf("BootstrapMCPConnect: Failed to get bootstrap token from credentials: %v", err)
-			req.ResponseWriter.Header().Set("WWW-Authenticate", `Bearer error="invalid_token", error_description="Bootstrap token validation failed"`)
-			http.Error(req.ResponseWriter, "unauthorized: bootstrap token validation failed", http.StatusUnauthorized)
-			return nil
-		}
-	} else {
-		expectedToken = bootstrapTokenCred.Env["token"]
+		req.ResponseWriter.Header().Set("WWW-Authenticate", `Bearer error="invalid_token", error_description="Bootstrap token validation failed"`)
+		http.Error(req.ResponseWriter, "unauthorized: bootstrap token validation failed", http.StatusUnauthorized)
+		return nil
 	}
 
+	expectedToken := bootstrapTokenCred.Env["token"]
 	if expectedToken == "" || bootstrapTokenHeader != expectedToken {
-		log.Warnf("BootstrapMCPConnect: Invalid bootstrap token provided (expected length: %d, provided length: %d)", len(expectedToken), len(bootstrapTokenHeader))
 		req.ResponseWriter.Header().Set("WWW-Authenticate", `Bearer error="invalid_token", error_description="Invalid OBOT_BOOTSTRAP_TOKEN"`)
 		http.Error(req.ResponseWriter, "unauthorized: invalid bootstrap token", http.StatusUnauthorized)
 		return nil
 	}
 
-	// Use the default owner user instead of creating a bootstrap user
-	// Find the first owner user in the system
-	allUsers, err := h.gatewayClient.Users(req.Context(), gatewaytypes.UserQuery{})
-	if err != nil {
-		log.Errorf("BootstrapMCPConnect: Failed to list users: %v", err)
-		return fmt.Errorf("failed to find owner user: %w", err)
-	}
-
-	var ownerUser *gatewaytypes.User
-	for i := range allUsers {
-		if allUsers[i].Role.HasRole(types.RoleOwner) {
-			ownerUser = &allUsers[i]
-			break
-		}
-	}
-
-	if ownerUser == nil {
-		log.Errorf("BootstrapMCPConnect: No owner user found in the system")
-		return fmt.Errorf("no owner user found - please ensure at least one owner user exists")
-	}
-
-	// Get the owner user's identities to use their actual auth provider info
-	identities, err := h.gatewayClient.FindIdentitiesForUser(req.Context(), ownerUser.ID)
-	if err != nil {
-		log.Warnf("BootstrapMCPConnect: Failed to get identities for owner user %d: %v, using default", ownerUser.ID, err)
-	}
-
-	// Use the first identity's auth provider if available, otherwise use "bootstrap" as fallback
-	authProviderName := "bootstrap"
-	authProviderNamespace := ""
-	if len(identities) > 0 {
-		authProviderName = identities[0].AuthProviderName
-		authProviderNamespace = identities[0].AuthProviderNamespace
-	}
-
-	// Create user info using the owner user's actual identity
-	ownerUserInfo := &user.DefaultInfo{
-		Name:   ownerUser.Username,
-		UID:    fmt.Sprintf("%d", ownerUser.ID),
-		Groups: ownerUser.Role.Groups(),
+	// Create simple bootstrap user - no DB lookup, no access control
+	bootstrapUserInfo := &user.DefaultInfo{
+		Name:   "bootstrap",
+		UID:    "bootstrap",
+		Groups: []string{types.GroupOwner, types.GroupAdmin, types.GroupBasic, types.GroupAuthenticated},
 		Extra: map[string][]string{
-			"auth_provider_name":      {authProviderName},
-			"auth_provider_namespace": {authProviderNamespace},
-			// Mark as bootstrap-authenticated for bypass logic, but use owner's actual identity
+			"auth_provider_name":      {"bootstrap"},
 			"bootstrap_authenticated": {"true"},
 		},
 	}
 
-	log.Infof("BootstrapMCPConnect: Authenticated via bootstrap token for mcpID=%s, using owner user: %s (ID: %d, authProvider: %s/%s)", mcpID, ownerUser.Username, ownerUser.ID, authProviderNamespace, authProviderName)
-
-	sessionID := req.Request.Header.Get("Mcp-Session-Id")
-
-	// Create a new context with the owner user for all subsequent operations
-	ownerContext := api.Context{
+	// Create context with bootstrap user
+	bootstrapContext := api.Context{
 		ResponseWriter: req.ResponseWriter,
 		Request:        req.Request,
 		GPTClient:      req.GPTClient,
 		Storage:        req.Storage,
 		GatewayClient:  req.GatewayClient,
-		User:           ownerUserInfo,
+		User:           bootstrapUserInfo,
 		APIBaseURL:     req.APIBaseURL,
 	}
 
-	// Get the MCP server and configuration directly (bypassing authorization checks)
-	log.Debugf("BootstrapMCPConnect: Attempting to get MCP server config for mcpID=%s", mcpID)
-	_, mcpServer, mcpServerConfig, err := handlers.ServerForActionWithConnectID(ownerContext, mcpID, h.mcpSessionManager.TokenService(), h.baseURL)
-	if err == nil && mcpServer.Spec.Template {
-		log.Warnf("Attempted connection to MCP server template: %s", mcpID)
-		err = apierrors.NewNotFound(schema.GroupResource{Group: "obot.obot.ai", Resource: "mcpserver"}, mcpID)
-	}
-
-	ss := newSessionStore(h, mcpID, ownerUserInfo.GetUID())
-
+	// Get MCP server config - bypass all checks
+	_, mcpServer, mcpServerConfig, err := handlers.ServerForActionWithConnectID(bootstrapContext, mcpID, h.mcpSessionManager.TokenService(), h.baseURL)
 	if err != nil {
-		log.Errorf("BootstrapMCPConnect: Failed to get MCP server config for mcpID=%s, userUID=%s: %v", mcpID, ownerUserInfo.GetUID(), err)
-		// Log more details about the error
-		if apierrors.IsNotFound(err) {
-			log.Errorf("BootstrapMCPConnect: MCP server not found: %s (may not exist or user may not have access)", mcpID)
-		} else if apierrors.IsForbidden(err) {
-			log.Errorf("BootstrapMCPConnect: Access forbidden to MCP server: %s (authorization issue)", mcpID)
-		} else {
-			log.Errorf("BootstrapMCPConnect: Unexpected error getting MCP server config: %T: %v", err, err)
-		}
-		if apierrors.IsNotFound(err) {
-			if sessionID != "" {
-				session, found, err := ss.LoadAndDelete(req.Context(), h, sessionID)
-				if err != nil {
-					log.Errorf("Failed to delete session %s: %v", sessionID, err)
-					return fmt.Errorf("failed to get mcp server config: %w", err)
-				}
-
-				if found {
-					session.Close(true)
-				}
-			}
-		}
 		return fmt.Errorf("failed to get mcp server config: %w", err)
 	}
 
-	log.Infof("BootstrapMCPConnect: Successfully retrieved MCP server config: mcpID=%s, serverName=%s, runtime=%s", mcpID, mcpServer.Name, mcpServer.Spec.Manifest.Runtime)
+	if mcpServer.Spec.Template {
+		return apierrors.NewNotFound(schema.GroupResource{Group: "obot.obot.ai", Resource: "mcpserver"}, mcpID)
+	}
 
-	// For remote servers pointing to bootstrap endpoints, add the bootstrap token to headers
-	// This ensures that when the MCP client connects to the remote server, it authenticates properly
+	ss := newSessionStore(h, mcpID, bootstrapUserInfo.GetUID())
+
+	// Add bootstrap token to headers for remote bootstrap endpoints
 	if mcpServerConfig.Runtime == types.RuntimeRemote && strings.Contains(mcpServerConfig.URL, "/mcp-bootstrap/") {
-		// Check if OBOT_BOOTSTRAP_TOKEN header is already present
 		hasBootstrapToken := false
 		for _, header := range mcpServerConfig.Headers {
 			if strings.HasPrefix(header, "OBOT_BOOTSTRAP_TOKEN=") || strings.HasPrefix(header, "Authorization=") {
@@ -924,27 +809,24 @@ func (h *Handler) BootstrapMCPConnect(req api.Context) error {
 				break
 			}
 		}
-		
 		if !hasBootstrapToken {
-			// Add the bootstrap token to the headers
 			mcpServerConfig.Headers = append(mcpServerConfig.Headers, fmt.Sprintf("OBOT_BOOTSTRAP_TOKEN=%s", bootstrapTokenHeader))
-			log.Debugf("BootstrapMCPConnect: Added bootstrap token to headers for remote server: %s", mcpServerConfig.URL)
 		}
 	}
 
 	messageCtx := messageContext{
-		userID:       ownerUserInfo.GetUID(),
+		userID:       bootstrapUserInfo.GetUID(),
 		mcpID:        mcpID,
 		mcpServer:    mcpServer,
 		serverConfig: mcpServerConfig,
-		req:          ownerContext.Request,
-		resp:         ownerContext.ResponseWriter,
+		req:          bootstrapContext.Request,
+		resp:         bootstrapContext.ResponseWriter,
 	}
 
 	// Handle composite servers
 	if mcpServer.Spec.Manifest.Runtime == types.RuntimeComposite {
 		var componentServerList v1.MCPServerList
-		if err := ownerContext.List(&componentServerList,
+		if err := bootstrapContext.List(&componentServerList,
 			kclient.InNamespace(mcpServer.Namespace),
 			kclient.MatchingFields{
 				"spec.compositeName": mcpServer.Name,
@@ -953,7 +835,7 @@ func (h *Handler) BootstrapMCPConnect(req api.Context) error {
 		}
 
 		var componentInstanceList v1.MCPServerInstanceList
-		if err := ownerContext.List(&componentInstanceList,
+		if err := bootstrapContext.List(&componentInstanceList,
 			kclient.InNamespace(mcpServer.Namespace),
 			kclient.MatchingFields{
 				"spec.compositeName": mcpServer.Name,
@@ -979,13 +861,11 @@ func (h *Handler) BootstrapMCPConnect(req api.Context) error {
 
 		for _, componentServer := range componentServerList.Items {
 			if disabledComponents[componentServer.Spec.MCPServerCatalogEntryName] {
-				log.Debugf("Skipping component server %s not enabled in composite config", componentServer.Name)
 				continue
 			}
 
-			srv, config, err := handlers.ServerForAction(ownerContext, componentServer.Name, h.mcpSessionManager.TokenService(), h.baseURL)
+			srv, config, err := handlers.ServerForAction(bootstrapContext, componentServer.Name, h.mcpSessionManager.TokenService(), h.baseURL)
 			if err != nil {
-				log.Warnf("Failed to get component server %s: %v", componentServer.Name, err)
 				continue
 			}
 
@@ -1000,12 +880,11 @@ func (h *Handler) BootstrapMCPConnect(req api.Context) error {
 				}
 				if !hasBootstrapToken {
 					config.Headers = append(config.Headers, fmt.Sprintf("OBOT_BOOTSTRAP_TOKEN=%s", bootstrapTokenHeader))
-					log.Debugf("BootstrapMCPConnect: Added bootstrap token to headers for component server: %s", config.URL)
 				}
 			}
 
 			componentServers = append(componentServers, messageContext{
-				userID:       ownerUserInfo.GetUID(),
+				userID:       bootstrapUserInfo.GetUID(),
 				mcpID:        srv.Name,
 				mcpServer:    srv,
 				serverConfig: config,
@@ -1014,19 +893,16 @@ func (h *Handler) BootstrapMCPConnect(req api.Context) error {
 
 		for _, componentInstance := range componentInstanceList.Items {
 			var multiUserServer v1.MCPServer
-			if err := ownerContext.Get(&multiUserServer, componentInstance.Spec.MCPServerName); err != nil {
-				log.Warnf("Failed to get multi-user server %s for instance %s: %v", componentInstance.Spec.MCPServerName, componentInstance.Name, err)
+			if err := bootstrapContext.Get(&multiUserServer, componentInstance.Spec.MCPServerName); err != nil {
 				continue
 			}
 
 			if disabledComponents[multiUserServer.Name] {
-				log.Debugf("Skipping component instance %s not enabled in composite config", componentInstance.Name)
 				continue
 			}
 
-			srv, config, err := handlers.ServerForAction(ownerContext, multiUserServer.Name, h.mcpSessionManager.TokenService(), h.baseURL)
+			srv, config, err := handlers.ServerForAction(bootstrapContext, multiUserServer.Name, h.mcpSessionManager.TokenService(), h.baseURL)
 			if err != nil {
-				log.Warnf("Failed to get multi-user server %s: %v", multiUserServer.Name, err)
 				continue
 			}
 
@@ -1041,12 +917,11 @@ func (h *Handler) BootstrapMCPConnect(req api.Context) error {
 				}
 				if !hasBootstrapToken {
 					config.Headers = append(config.Headers, fmt.Sprintf("OBOT_BOOTSTRAP_TOKEN=%s", bootstrapTokenHeader))
-					log.Debugf("BootstrapMCPConnect: Added bootstrap token to headers for component instance: %s", config.URL)
 				}
 			}
 
 			componentServers = append(componentServers, messageContext{
-				userID:       ownerUserInfo.GetUID(),
+				userID:       bootstrapUserInfo.GetUID(),
 				mcpID:        srv.Name,
 				mcpServer:    srv,
 				serverConfig: config,
@@ -1061,55 +936,10 @@ func (h *Handler) BootstrapMCPConnect(req api.Context) error {
 	}
 
 	// Update the request context with the message context
-	// Note: We need to preserve the original request body, so we don't modify the request itself
-	// The MCP HTTP server will read the body from the request
-	ownerContext.Request = ownerContext.Request.WithContext(withMessageContext(ownerContext.Request.Context(), messageCtx))
-
-	log.Debugf("BootstrapMCPConnect: Serving MCP request: mcpID=%s, method=%s, path=%s, contentLength=%d", mcpID, ownerContext.Request.Method, ownerContext.Request.URL.Path, ownerContext.Request.ContentLength)
-
-	// For stateless HTTP requests (like LangGraph), ensure session is initialized
-	// Check if this is a tools/call request without a session ID
-	if ownerContext.Request.Method == "POST" && ownerContext.Request.Header.Get("Mcp-Session-Id") == "" {
-		// Read the request body to check if it's a tools/call request
-		bodyBytes, err := io.ReadAll(ownerContext.Request.Body)
-		if err == nil {
-			ownerContext.Request.Body = io.NopCloser(bytes.NewReader(bodyBytes))
-			
-			// Check if it's a JSON-RPC tools/call request
-			var jsonRPCReq struct {
-				Method string `json:"method"`
-			}
-			if json.Unmarshal(bodyBytes, &jsonRPCReq) == nil && jsonRPCReq.Method == methodToolsCall {
-				log.Debugf("BootstrapMCPConnect: Detected stateless tools/call request, creating and initializing session")
-				
-				// Create a session ID for this stateless request
-				sessionID := uuid.New().String()
-				
-				// Set the session ID in the request header
-				ownerContext.Request.Header.Set("Mcp-Session-Id", sessionID)
-				
-				// For stateless requests, we need to ensure the session exists before the HTTP server processes it
-				// The HTTP server will create the session when it receives the request, but we need to
-				// ensure it can find the server config. The session will be created automatically by the
-				// HTTP server when it processes the request.
-				// 
-				// However, the HTTP server's Acquire method returns nil when the session doesn't exist,
-				// which causes "Session not found" errors. We need to ensure the session is created.
-				//
-				// The solution is to let the HTTP server handle session creation, but we need to ensure
-				// it can. The HTTP server should create the session when it receives a request with a
-				// session ID that doesn't exist yet.
-				//
-				// For now, we'll just set the session ID and let the HTTP server handle it.
-				// If the session doesn't exist, the HTTP server should create it automatically.
-				log.Debugf("BootstrapMCPConnect: Set session ID %s for stateless request, HTTP server will create session", sessionID)
-			}
-		}
-	}
+	bootstrapContext.Request = bootstrapContext.Request.WithContext(withMessageContext(bootstrapContext.Request.Context(), messageCtx))
 
 	// Serve the HTTP request (handles WebSocket, SSE, and direct HTTP POST)
-	// The MCP HTTP server handles JSON-RPC requests and routes them appropriately
-	nmcp.NewHTTPServer(nil, h, nmcp.HTTPServerOptions{SessionStore: ss}).ServeHTTP(ownerContext.ResponseWriter, ownerContext.Request)
+	nmcp.NewHTTPServer(nil, h, nmcp.HTTPServerOptions{SessionStore: ss}).ServeHTTP(bootstrapContext.ResponseWriter, bootstrapContext.Request)
 
 	return nil
 }

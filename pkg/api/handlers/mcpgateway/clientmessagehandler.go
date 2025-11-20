@@ -37,11 +37,13 @@ func (h *Handler) asClientOption(session *nmcp.Session, userID, mcpID, mcpServer
 		},
 	}
 
-	// For remote servers pointing to bootstrap endpoints, skip token storage
+	// For bootstrap users or remote servers pointing to bootstrap endpoints, skip token storage
 	// The bootstrap token is already in the headers, and OAuth won't work for bootstrap endpoints
 	var tokenStorage nmcp.TokenStorage
-	if serverConfig.Runtime == types.RuntimeRemote && strings.Contains(serverConfig.URL, "/mcp-bootstrap/") {
-		// Skip token storage for bootstrap endpoints - authentication is handled via headers
+	isBootstrapUser := userID == "bootstrap"
+	isBootstrapEndpoint := serverConfig.Runtime == types.RuntimeRemote && strings.Contains(serverConfig.URL, "/mcp-bootstrap/")
+	if isBootstrapUser || isBootstrapEndpoint {
+		// Skip token storage for bootstrap - authentication is handled via headers
 		tokenStorage = nil
 	} else {
 		tokenStorage = h.tokenStore.ForUserAndMCP(userID, mcpID)
